@@ -1,1 +1,49 @@
-
+name: Scan Sharon
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '30 2,14 * * *'
+concurrency:
+  group: scan-sharon
+  cancel-in-progress: false
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+      - run: pip install -r requirements.txt
+      - run: curl -L -o GeoLite2-Country.mmdb https://github.com/P3TERX/GeoLite.mmdb/raw/download/GeoLite2-Country.mmdb
+      - name: Pull state
+        env:
+          TOKEN: ${{ secrets.RESULT_REPO_TOKEN }}
+        run: |
+          git clone https://x-access-token:${TOKEN}@github.com/zerogege/proxyip.git result_repo
+          mkdir -p state
+          cp result_repo/state/*.txt state/ 2>/dev/null || true
+          cp result_repo/*.txt ./ 2>/dev/null || true
+      - name: Run Scan
+        env:
+          CUSTOM_CF_DOMAIN: ${{ secrets.CUSTOM_CF_DOMAIN }}
+        run: python check_cf_asn.py "396856" "Sharon" "10000-50000"
+      - name: Push
+        env:
+          TOKEN: ${{ secrets.RESULT_REPO_TOKEN }}
+        run: |
+          cd result_repo
+          git pull
+          mkdir -p state
+          cp ../state/*.txt state/ 2>/dev/null || true
+          for f in ../*.txt; do
+            fn=$(basename "$f")
+            if [ "$fn" != "ip.txt" ] && [ "$fn" != "requirements.txt" ]; then cp "$f" ./ 2>/dev/null || true; fi
+          done
+          git config user.email "bot@users.noreply.github.com"
+          git config user.name "bot"
+          git add -A
+          if git diff --staged --quiet; then echo "no change"; else git commit -m "Sharon update" && git pull --rebase && git push; fi
