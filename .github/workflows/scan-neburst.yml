@@ -30,7 +30,7 @@ jobs:
       - name: Run Scan
         env:
           CUSTOM_CF_DOMAIN: ${{ secrets.CUSTOM_CF_DOMAIN }}
-        run: python check_cf_asn.py "8143" "Neburst" "1-65535"
+        run: python check_cf_asn.py "8143" "Neburst" "443,2053,2083,2096,8443,55555,20000-21000,50000-61000"
       - name: Push
         env:
           TOKEN: ${{ secrets.RESULT_REPO_TOKEN }}
