@@ -1,10 +1,10 @@
-name: Scan Sharon
+name: Scan Neburst
 on:
   workflow_dispatch:
   schedule:
-    - cron: '30 2,14 * * *'
+    - cron: '50 2,14 * * *'
 concurrency:
-  group: scan-sharon
+  group: scan-neburst
   cancel-in-progress: false
 jobs:
   scan:
@@ -30,7 +30,7 @@ jobs:
       - name: Run Scan
         env:
           CUSTOM_CF_DOMAIN: ${{ secrets.CUSTOM_CF_DOMAIN }}
-        run: python check_cf_asn.py "396856" "Sharon" "10000-50000"
+        run: python check_cf_asn.py "8143" "Neburst" "10000-50000"
       - name: Push
         env:
           TOKEN: ${{ secrets.RESULT_REPO_TOKEN }}
@@ -46,4 +46,4 @@ jobs:
           git config user.email "bot@users.noreply.github.com"
           git config user.name "bot"
           git add -A
-          if git diff --staged --quiet; then echo "no change"; else git commit -m "Sharon update" && git pull --rebase && git push; fi
+          if git diff --staged --quiet; then echo "no change"; else git commit -m "Neburst update" && git pull --rebase && git push; fi
