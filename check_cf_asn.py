@@ -55,7 +55,7 @@ CUSTOM_CF_DOMAIN = os.getenv("CUSTOM_CF_DOMAIN", "zeroo.ccwu.cc")
 
 GEOIP_DB = "GeoLite2-Country.mmdb"
 STATE_DIR = "state"   # 状态文件目录（抽过端口、已出货组合）
-SAMPLE_N = 50         # 每次随机抽的端口数
+SAMPLE_N = 250         # 每次随机抽的端口数
 
 CF_SNI_1 = "www.cloudflare.com"
 STAGE1_CONCURRENCY = 50
