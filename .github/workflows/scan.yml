@@ -1,0 +1,82 @@
+name: CF ASN IP Scanner
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: '目标 ASN/网段/IP/文件 (如 906 或 906,32519)'
+        required: true
+        default: 'AS36002'
+      name_label:
+        description: '名字(填auto自动识别, 或手动填如DMIT)'
+        required: false
+        default: 'auto'
+      ports:
+        description: '端口(逗号分隔或区间如10000-50000)'
+        required: false
+        default: '443,8443,2053,2083,2096'
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Download GeoIP Database
+        run: |
+          curl -L -o GeoLite2-Country.mmdb https://github.com/P3TERX/GeoLite.mmdb/raw/download/GeoLite2-Country.mmdb
+
+      - name: Pull state from private repo
+        env:
+          TOKEN: ${{ secrets.RESULT_REPO_TOKEN }}
+        run: |
+          git clone https://x-access-token:${TOKEN}@github.com/zerogege/proxyip.git result_repo
+          mkdir -p state
+          cp result_repo/state/*.txt state/ 2>/dev/null || true
+          cp result_repo/*.txt ./ 2>/dev/null || true
+
+      - name: Run Scan
+        env:
+          CUSTOM_CF_DOMAIN: ${{ secrets.CUSTOM_CF_DOMAIN }}
+        run: |
+          python check_cf_asn.py "${{ github.event.inputs.target }}" "${{ github.event.inputs.name_label }}" "${{ github.event.inputs.ports }}"
+
+      - name: Push result to private repo
+        env:
+          TOKEN: ${{ secrets.RESULT_REPO_TOKEN }}
+        run: |
+          cd result_repo
+          git pull
+          mkdir -p state
+          cp ../state/*.txt state/ 2>/dev/null || true
+          for f in ../*.txt; do
+            fn=$(basename "$f")
+            if [ "$fn" != "ip.txt" ] && [ "$fn" != "requirements.txt" ]; then
+              cp "$f" ./ 2>/dev/null || true
+            fi
+          done
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+          git add -A
+          if git diff --staged --quiet; then
+            echo "no change"
+          else
+            git commit -m "auto: update result"
+            git pull --rebase
+            git push
+          fi
