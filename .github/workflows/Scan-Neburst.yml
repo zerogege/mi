@@ -61,6 +61,27 @@ jobs:
             git push
           fi
 
+      - name: Backup to GitLab
+        if: always()
+        env:
+          GITLAB_TOKEN: ${{ secrets.GITLAB_TOKEN }}
+        run: |
+          git clone https://oauth2:${GITLAB_TOKEN}@gitlab.com/7969521/proxyip-backup.git gitlab_repo
+          cp -r result_repo/*.txt gitlab_repo/ 2>/dev/null || true
+          mkdir -p gitlab_repo/state
+          cp result_repo/state/*.txt gitlab_repo/state/ 2>/dev/null || true
+          cd gitlab_repo
+          git config user.email "bot@backup.com"
+          git config user.name "bot"
+          git add -A
+          if git diff --staged --quiet; then
+            echo "GitLab: no change"
+          else
+            git commit -m "backup"
+            git pull --rebase 2>/dev/null || true
+            git push
+          fi
+
       - name: Notify TG
         if: always()
         run: |
