@@ -14,9 +14,9 @@ CF_SNI_1 = "www.cloudflare.com"
 CF_HOST_TEST = "crypto.cloudflare.com"
 
 # 阶段零：TCP 探活
-TCP_CONCURRENCY = 1500     # 探活并发（轻量，可高）
-TCP_TIMEOUT = 1.5          # 探活超时
-TCP_RETRY = 1              # 探活失败重试次数
+TCP_CONCURRENCY = 1500
+TCP_TIMEOUT = 1.5
+TCP_RETRY = 1
 
 # TLS 三阶段
 TLS_CONCURRENCY = 300
@@ -27,25 +27,11 @@ STAGE3_TIMEOUT = 2.5
 PORT_START = 1
 PORT_END = 65535
 
-# 种子 IP -> ASN 标签
+# 种子网段 -> ASN 标签（支持 /24 段 或 单个IP）
 SEEDS = {
-    # Neburst
-    "23.149.108.144": "Neburst",
-    "152.175.214.43": "Neburst",
-    "23.146.4.20": "Neburst",
-    # Sharon
-    "157.254.32.57": "Sharon",
-    "157.254.198.27": "Sharon",
-    # GOMAMI
-    "64.204.66.49": "GOMAMI",
-    "103.112.1.96": "GOMAMI",
-    "151.244.134.232": "GOMAMI",
-    "103.73.220.49": "GOMAMI",
-    "103.238.130.98": "GOMAMI",
-    "141.11.77.158": "GOMAMI",
-    "191.101.132.166": "GOMAMI",
-    "103.26.8.38": "GOMAMI",
-    "178.94.14.121": "GOMAMI",
+    "23.149.108.0/24": "Neburst",   # 20514 所在段
+    "152.175.214.0/24": "Neburst",  # 30002 所在段
+    "157.254.198.0/24": "Sharon",   # 50795 所在段
 }
 
 try:
@@ -74,6 +60,23 @@ def get_country(ip):
         return "??"
 
 
+def expand_seeds():
+    """把 SEEDS 里的 /24 段或单IP 展开成 {ip: 标签}"""
+    ip_tag = {}
+    for item, tag in SEEDS.items():
+        try:
+            if "/" in item:
+                net = ipaddress.ip_network(item, strict=False)
+                for ip in net.hosts():
+                    ip_tag[str(ip)] = tag
+            else:
+                ipaddress.ip_address(item)
+                ip_tag[item] = tag
+        except Exception:
+            continue
+    return ip_tag
+
+
 def match_domain_in_cert(sni_domain, cert_str):
     sni_domain = sni_domain.lower()
     cert_str = cert_str.lower()
@@ -90,7 +93,7 @@ def match_domain_in_cert(sni_domain, cert_str):
 
 
 async def tcp_alive(ip, port, sem):
-    """阶段零：极速 TCP 探活（超时1.5s + 重试）。只测端口开不开。"""
+    """阶段零：TCP 探活（超时+重试）"""
     async with sem:
         for attempt in range(TCP_RETRY + 1):
             writer = None
@@ -181,9 +184,10 @@ async def full_verify(ip, port, sem):
 
 
 async def main():
-    ips = list(SEEDS.keys())
+    ip_tag = expand_seeds()
+    ips = list(ip_tag.keys())
     total = len(ips) * (PORT_END - PORT_START + 1)
-    print(f"[*] 深挖：{len(ips)} 个种子 IP × 全端口({PORT_START}-{PORT_END}) = {total:,} 个目标", flush=True)
+    print(f"[*] 深挖 /24 段：{len(ips)} 个 IP × 全端口({PORT_START}-{PORT_END}) = {total:,} 个目标", flush=True)
 
     # ==================== 阶段零：TCP 探活 ====================
     print(f"\n[0/3 阶段零 TCP 探活] 并发={TCP_CONCURRENCY} 超时={TCP_TIMEOUT}s 重试={TCP_RETRY}...", flush=True)
@@ -196,7 +200,7 @@ async def main():
         ok = await tcp_alive(ip, port, tcp_sem)
         async with lock:
             done[0] += 1
-            if done[0] % 100000 == 0:
+            if done[0] % 500000 == 0:
                 print(f"  [探活进度] {done[0]:,}/{total:,}", flush=True)
         return (ip, port) if ok else None
 
@@ -211,7 +215,7 @@ async def main():
             pass
         return
 
-    # ==================== 第一+二+三阶段：TLS 验证 ====================
+    # ==================== TLS 三阶段验证 ====================
     print(f"\n[1-3/3 TLS 三阶段验证] 验证 {len(open_ports)} 个开放端口...", flush=True)
     tls_sem = asyncio.Semaphore(TLS_CONCURRENCY)
     v_tasks = [full_verify(ip, port, tls_sem) for ip, port in open_ports]
@@ -223,7 +227,7 @@ async def main():
     lines = set()
     for ip, port in final:
         country = get_country(ip)
-        asn_label = SEEDS.get(ip, "DEEP")
+        asn_label = ip_tag.get(ip, "DEEP")
         lines.add(f"{ip}:{port}#{country} {asn_label}")
 
     def sort_key(line):
@@ -240,26 +244,24 @@ async def main():
         for line in sorted_lines:
             f.write(line + "\n")
 
-    # ==================== 按 IP 汇总打印（看规律）====================
-    print("\n==================== 深挖结果（按IP）====================", flush=True)
+    # ==================== 汇总打印 ====================
+    print("\n==================== 深挖结果（仅列出有开放端口的IP）====================", flush=True)
 
-    # 开放端口按 IP 归类（TCP层面开着的，不一定过三阶段）
     open_by_ip = {}
     for ip, port in open_ports:
         open_by_ip.setdefault(ip, []).append(port)
-
-    # 最终有效端口按 IP 归类（过了三阶段的）
     valid_by_ip = {}
     for ip, port in final:
         valid_by_ip.setdefault(ip, []).append(port)
 
+    # 只打印有开放端口的 IP（/24 段展开后 IP 很多，全打印太长）
     for ip in ips:
-        tag = SEEDS[ip]
         opens = sorted(open_by_ip.get(ip, []))
+        if not opens:
+            continue
+        tag = ip_tag[ip]
         valids = sorted(valid_by_ip.get(ip, []))
-        print(f"  {ip} [{tag}]", flush=True)
-        print(f"      TCP开放端口: {opens if opens else '无'}", flush=True)
-        print(f"      可用(过三阶段): {valids if valids else '无'}", flush=True)
+        print(f"  {ip} [{tag}]  开放:{opens}  可用:{valids if valids else '无'}", flush=True)
 
     print(f"\n[+] 共 {len(sorted_lines)} 个可用端口，已存 deep_result.txt", flush=True)
 
