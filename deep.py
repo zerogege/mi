@@ -9,25 +9,20 @@ import geoip2.database
 # ==================== 配置 ====================
 CUSTOM_CF_DOMAIN = os.getenv("CUSTOM_CF_DOMAIN", "zeroo.ccwu.cc")
 GEOIP_DB = "GeoLite2-Country.mmdb"
-
 CF_SNI_1 = "www.cloudflare.com"
 CF_HOST_TEST = "crypto.cloudflare.com"
-
-# 阶段零：TCP 探活
-TCP_CONCURRENCY = 1500
-TCP_TIMEOUT = 1.5
-TCP_RETRY = 1
-
+# 阶段零：TCP 探活（提速版）
+TCP_CONCURRENCY = 4000
+TCP_TIMEOUT = 1.0
+TCP_RETRY = 0
 # TLS 三阶段
 TLS_CONCURRENCY = 300
 STAGE1_TIMEOUT = 3
 STAGE2_TIMEOUT = 2.5
 STAGE3_TIMEOUT = 2.5
-
 PORT_START = 1
 PORT_END = 65535
-
-# 种子网段 -> ASN 标签（支持 /24 段 或 单个IP）
+# 种子网段 -> ASN 标签
 SEEDS = {
     "23.149.108.0/24": "Neburst",
 }
