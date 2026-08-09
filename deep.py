@@ -9,19 +9,26 @@ import geoip2.database
 # ==================== 配置 ====================
 CUSTOM_CF_DOMAIN = os.getenv("CUSTOM_CF_DOMAIN", "zeroo.ccwu.cc")
 GEOIP_DB = "GeoLite2-Country.mmdb"
+
 CF_SNI_1 = "www.cloudflare.com"
 CF_HOST_TEST = "crypto.cloudflare.com"
-# 阶段零：TCP 探活（提速版）
+
+# 阶段零：TCP 探活
 TCP_CONCURRENCY = 4000
 TCP_TIMEOUT = 1.0
 TCP_RETRY = 0
+BATCH_SIZE = 500000        # 每批 50 万目标（防内存爆）
+
 # TLS 三阶段
 TLS_CONCURRENCY = 300
 STAGE1_TIMEOUT = 3
 STAGE2_TIMEOUT = 2.5
 STAGE3_TIMEOUT = 2.5
-PORT_START = 1
-PORT_END = 65535
+
+# 端口范围（先扫已知有货的区间）
+PORT_START = 20000
+PORT_END = 60000
+
 # 种子网段 -> ASN 标签
 SEEDS = {
     "23.149.108.0/24": "Neburst",
@@ -54,7 +61,6 @@ def get_country(ip):
 
 
 def expand_seeds():
-    """把 SEEDS 里的 /24 段或单IP 展开成 {ip: 标签}"""
     ip_tag = {}
     for item, tag in SEEDS.items():
         try:
@@ -86,7 +92,6 @@ def match_domain_in_cert(sni_domain, cert_str):
 
 
 async def tcp_alive(ip, port, sem):
-    """阶段零：TCP 探活（超时+重试）"""
     async with sem:
         for attempt in range(TCP_RETRY + 1):
             writer = None
@@ -165,7 +170,6 @@ async def check_http(ip, port, host, timeout_val, sem):
 
 
 async def full_verify(ip, port, sem):
-    """第一+二+三阶段完整验证"""
     if not await check_tls_sni(ip, port, CF_SNI_1, STAGE1_TIMEOUT, sem):
         return False
     if not await check_http(ip, port, CF_HOST_TEST, STAGE2_TIMEOUT, sem):
@@ -179,27 +183,40 @@ async def full_verify(ip, port, sem):
 async def main():
     ip_tag = expand_seeds()
     ips = list(ip_tag.keys())
-    total = len(ips) * (PORT_END - PORT_START + 1)
-    print(f"[*] 深挖 /24 段：{len(ips)} 个 IP × 全端口({PORT_START}-{PORT_END}) = {total:,} 个目标", flush=True)
+    port_count = PORT_END - PORT_START + 1
+    total = len(ips) * port_count
+    print(f"[*] 深挖：{len(ips)} 个 IP × 端口({PORT_START}-{PORT_END}, {port_count}个) = {total:,} 个目标", flush=True)
 
-    # ==================== 阶段零：TCP 探活 ====================
-    print(f"\n[0/3 阶段零 TCP 探活] 并发={TCP_CONCURRENCY} 超时={TCP_TIMEOUT}s 重试={TCP_RETRY}...", flush=True)
+    # ==================== 阶段零：分批 TCP 探活 ====================
+    print(f"\n[0/3 阶段零 TCP 探活] 并发={TCP_CONCURRENCY} 超时={TCP_TIMEOUT}s 重试={TCP_RETRY} 批大小={BATCH_SIZE:,}...", flush=True)
     tcp_sem = asyncio.Semaphore(TCP_CONCURRENCY)
-
-    done = [0]
-    lock = asyncio.Lock()
 
     async def probe(ip, port):
         ok = await tcp_alive(ip, port, tcp_sem)
-        async with lock:
-            done[0] += 1
-            if done[0] % 500000 == 0:
-                print(f"  [探活进度] {done[0]:,}/{total:,}", flush=True)
         return (ip, port) if ok else None
 
-    tcp_tasks = [probe(ip, port) for ip in ips for port in range(PORT_START, PORT_END + 1)]
-    tcp_results = await asyncio.gather(*tcp_tasks)
-    open_ports = [r for r in tcp_results if r]
+    open_ports = []
+    batch = []
+    done = 0
+
+    for ip in ips:
+        for port in range(PORT_START, PORT_END + 1):
+            batch.append((ip, port))
+            if len(batch) >= BATCH_SIZE:
+                tasks = [probe(a, b) for a, b in batch]
+                results = await asyncio.gather(*tasks)
+                open_ports.extend([r for r in results if r])
+                done += len(batch)
+                print(f"  [探活进度] {done:,}/{total:,} | 已找到开放: {len(open_ports)}", flush=True)
+                batch = []
+    # 最后一批
+    if batch:
+        tasks = [probe(a, b) for a, b in batch]
+        results = await asyncio.gather(*tasks)
+        open_ports.extend([r for r in results if r])
+        done += len(batch)
+        print(f"  [探活进度] {done:,}/{total:,} | 已找到开放: {len(open_ports)}", flush=True)
+
     print(f"[+] TCP 探活完成！开放端口: {len(open_ports)} 个（过滤掉 {total - len(open_ports):,} 个关闭端口）", flush=True)
 
     if not open_ports:
@@ -216,7 +233,7 @@ async def main():
     final = [open_ports[i] for i, ok in enumerate(v_res) if ok]
     print(f"[+] 验证完成！最终有效: {len(final)} 个", flush=True)
 
-    # ==================== 输出（标签用 ASN）====================
+    # ==================== 输出 ====================
     lines = set()
     for ip, port in final:
         country = get_country(ip)
@@ -237,9 +254,8 @@ async def main():
         for line in sorted_lines:
             f.write(line + "\n")
 
-    # ==================== 汇总打印 ====================
-    print("\n==================== 深挖结果（仅列出有开放端口的IP）====================", flush=True)
-
+    # ==================== 汇总打印（只列有开放端口的IP）====================
+    print("\n==================== 深挖结果（仅列有开放端口的IP）====================", flush=True)
     open_by_ip = {}
     for ip, port in open_ports:
         open_by_ip.setdefault(ip, []).append(port)
@@ -247,7 +263,6 @@ async def main():
     for ip, port in final:
         valid_by_ip.setdefault(ip, []).append(port)
 
-    # 只打印有开放端口的 IP（/24 段展开后 IP 很多，全打印太长）
     for ip in ips:
         opens = sorted(open_by_ip.get(ip, []))
         if not opens:
