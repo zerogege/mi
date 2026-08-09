@@ -14,9 +14,9 @@ CF_SNI_1 = "www.cloudflare.com"
 CF_HOST_TEST = "crypto.cloudflare.com"
 
 # 阶段零：TCP 探活（保守版）
-TCP_CONCURRENCY = 1500
+TCP_CONCURRENCY = 2500
 TCP_TIMEOUT = 2.0
-TCP_RETRY = 2
+TCP_RETRY = 1
 BATCH_SIZE = 500000
 
 # TLS 三阶段（保持不动）
