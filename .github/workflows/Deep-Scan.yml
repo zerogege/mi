@@ -1,0 +1,42 @@
+name: Deep Scan Seeds
+
+on:
+  workflow_dispatch:
+
+jobs:
+  deep:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+      - run: pip install -r requirements.txt
+      - run: curl -L -o GeoLite2-Country.mmdb https://github.com/P3TERX/GeoLite.mmdb/raw/download/GeoLite2-Country.mmdb
+
+      - name: Deep Scan
+        env:
+          CUSTOM_CF_DOMAIN: ${{ secrets.CUSTOM_CF_DOMAIN }}
+        run: python deep.py
+
+      - name: Show result
+        if: always()
+        run: |
+          echo "===== deep_result.txt ====="
+          cat deep_result.txt 2>/dev/null || echo "(空)"
+
+      - name: Notify TG
+        if: always()
+        run: |
+          COUNT=$(wc -l < deep_result.txt 2>/dev/null || echo "0")
+          if [ "${{ job.status }}" = "success" ]; then
+            MSG="🔍 深挖完成%0A有效端口: ${COUNT} 个%0A（详见 Actions 日志）"
+          else
+            MSG="❌ 深挖失败%0A状态: ${{ job.status }}"
+          fi
+          curl "https://api.telegram.org/bot${{ secrets.TG_TOKEN }}/sendMessage" \
+            -d chat_id=${{ secrets.TG_CHAT_ID }} \
+            -d text="${MSG}"
