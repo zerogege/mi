@@ -13,23 +13,23 @@ GEOIP_DB = "GeoLite2-Country.mmdb"
 CF_SNI_1 = "www.cloudflare.com"
 CF_HOST_TEST = "crypto.cloudflare.com"
 
-# 阶段零：TCP 探活
-TCP_CONCURRENCY = 4000
-TCP_TIMEOUT = 1.0
-TCP_RETRY = 0
-BATCH_SIZE = 500000        # 每批 50 万目标（防内存爆）
+# 阶段零：TCP 探活（保守版）
+TCP_CONCURRENCY = 1500
+TCP_TIMEOUT = 2.0
+TCP_RETRY = 2
+BATCH_SIZE = 500000
 
-# TLS 三阶段
+# TLS 三阶段（保持不动）
 TLS_CONCURRENCY = 300
 STAGE1_TIMEOUT = 3
 STAGE2_TIMEOUT = 2.5
 STAGE3_TIMEOUT = 2.5
 
-# 端口范围（先扫已知有货的区间）
+# 端口范围
 PORT_START = 20000
-PORT_END = 60000
+PORT_END = 40000
 
-# 种子网段 -> ASN 标签
+# 种子网段
 SEEDS = {
     "23.149.108.0/24": "Neburst",
 }
