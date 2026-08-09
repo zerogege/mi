@@ -22,7 +22,7 @@ STATE_DIR = "state"
 CF_SNI_1 = "www.cloudflare.com"
 CF_HOST_TEST = "crypto.cloudflare.com"
 
-# 自建检测 API（只用于最终确认少量 final）
+# 自建检测 API（只用于最终确认少量）
 CHECK_API = "https://check.tigaa.ccwu.cc/check"
 API_CONCURRENCY = 10
 API_TIMEOUT = 20
@@ -39,6 +39,7 @@ STAGE1_TIMEOUT = 3
 STAGE2_TIMEOUT = 2.5
 STAGE3_TIMEOUT = 2.5
 
+# 每次随机抽的端口数（1000，不超时）
 SAMPLE_N = 1000
 
 try:
@@ -256,7 +257,7 @@ async def check_http(ip, port, host, timeout_val, sem):
 
 
 async def full_verify(ip, port, sem):
-    """三阶段（本地，用于初筛）"""
+    """三阶段（本地初筛）"""
     if not await check_tls_sni(ip, port, CF_SNI_1, STAGE1_TIMEOUT, sem):
         return False
     if not await check_http(ip, port, CF_HOST_TEST, STAGE2_TIMEOUT, sem):
@@ -268,7 +269,7 @@ async def full_verify(ip, port, sem):
 
 
 async def api_verify(session, ip, port, sem):
-    """API 确认（只用于三阶段筛后的少量 final）"""
+    """API 确认（只用于初筛后的少量）"""
     async with sem:
         try:
             url = f"{CHECK_API}?proxyip={urllib.parse.quote(f'{ip}:{port}')}"
@@ -356,7 +357,7 @@ async def main():
             f.write("0")
         return
 
-    # 4. 三阶段初筛（本地，把上万开放端口筛到少量，不耗API）
+    # 4. 三阶段初筛（本地，把开放端口筛到少量，不耗API）
     print(f"\n[1/2 三阶段初筛] 筛选 {len(open_ports)} 个...", flush=True)
     tls_sem = asyncio.Semaphore(TLS_CONCURRENCY)
     v_tasks = [full_verify(ip, port, tls_sem) for ip, port in open_ports]
@@ -370,10 +371,10 @@ async def main():
             f.write("0")
         return
 
-    # 5. API 确认（只验证初筛后的少量，量小不打爆CF）+ 拿真实落地
+    # 5. API 确认（只验证初筛后的少量）+ 拿真实落地
     print(f"\n[2/2 API 确认] 确认 {len(stage_passed)} 个...", flush=True)
     api_sem = asyncio.Semaphore(API_CONCURRENCY)
-    final = []  # [(ip, port, 真实落地国家)]
+    final = []
     async with aiohttp.ClientSession() as session:
         a_tasks = [api_verify(session, ip, port, api_sem) for ip, port in stage_passed]
         a_res = await asyncio.gather(*a_tasks)
@@ -383,7 +384,7 @@ async def main():
                 final.append((ip, port, country))
     print(f"[+] API 确认通过: {len(final)} 个", flush=True)
 
-    # 6. 结果追加去重（地区用 API 真实落地）
+    # 6. 读旧结果 + 合并新结果
     output_filename = f"{name_label}.txt"
     old_lines = set()
     try:
@@ -394,6 +395,8 @@ async def main():
                     old_lines.add(s)
     except FileNotFoundError:
         pass
+
+    old_count = len(old_lines)
 
     new_count = 0
     for ip, port, country in final:
@@ -412,6 +415,16 @@ async def main():
             return ("??", ipaddress.ip_address("0.0.0.0"), 0)
 
     sorted_lines = sorted(old_lines, key=sort_key)
+
+    # ==================== 防覆盖保护 ====================
+    # 合并后结果远少于原有 → 疑似异常（如Pull失败没读到旧结果）→ 不覆盖
+    if old_count > 20 and len(sorted_lines) < old_count * 0.5:
+        print(f"[!] 合并后结果({len(sorted_lines)})远少于原有({old_count})，疑似读取异常，跳过写入，不覆盖！", flush=True)
+        with open("count.txt", "w") as f:
+            f.write("0")
+        return
+
+    # 7. 写回
     with open(output_filename, "w", encoding="utf-8", newline="\n") as f:
         for line in sorted_lines:
             f.write(line + "\n")
@@ -419,7 +432,7 @@ async def main():
     with open("count.txt", "w") as f:
         f.write(str(new_count))
 
-    # ==================== 脱敏输出（不打印具体 IP）====================
+    # ==================== 脱敏输出 ====================
     print("\n==================== 扫描结束 ====================", flush=True)
     print(f"本次新增: {new_count} 个 | 文件累计: {len(sorted_lines)} 个", flush=True)
     print(f"[+] 已保存（结果详见私库）", flush=True)
