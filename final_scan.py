@@ -33,7 +33,7 @@ STAGE2_TIMEOUT = 2.5
 STAGE3_TIMEOUT = 2.5
 
 # 每次随机抽的端口数
-SAMPLE_N = 200
+SAMPLE_N = 1800
 
 try:
     import uvloop
