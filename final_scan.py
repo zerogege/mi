@@ -39,7 +39,7 @@ STAGE1_TIMEOUT = 3
 STAGE2_TIMEOUT = 2.5
 STAGE3_TIMEOUT = 2.5
 
-SAMPLE_N = 1800
+SAMPLE_N = 1000
 
 try:
     import uvloop
