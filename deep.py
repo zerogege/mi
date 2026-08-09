@@ -12,10 +12,18 @@ GEOIP_DB = "GeoLite2-Country.mmdb"
 
 CF_SNI_1 = "www.cloudflare.com"
 CF_HOST_TEST = "crypto.cloudflare.com"
-STAGE1_TIMEOUT = 2
-STAGE2_TIMEOUT = 1.5
-STAGE3_TIMEOUT = 1.5
-CONCURRENCY = 300          # 总并发（温和，别把种子IP打爆）
+
+# 阶段零：TCP 探活
+TCP_CONCURRENCY = 1500     # 探活并发（轻量，可高）
+TCP_TIMEOUT = 1.5          # 探活超时
+TCP_RETRY = 1              # 探活失败重试次数
+
+# TLS 三阶段
+TLS_CONCURRENCY = 300
+STAGE1_TIMEOUT = 3
+STAGE2_TIMEOUT = 2.5
+STAGE3_TIMEOUT = 2.5
+
 PORT_START = 1
 PORT_END = 65535
 
@@ -81,6 +89,29 @@ def match_domain_in_cert(sni_domain, cert_str):
     return False
 
 
+async def tcp_alive(ip, port, sem):
+    """阶段零：极速 TCP 探活（超时1.5s + 重试）。只测端口开不开。"""
+    async with sem:
+        for attempt in range(TCP_RETRY + 1):
+            writer = None
+            try:
+                conn = asyncio.open_connection(ip, port)
+                reader, writer = await asyncio.wait_for(conn, timeout=TCP_TIMEOUT)
+                return True
+            except Exception:
+                if attempt < TCP_RETRY:
+                    continue
+                return False
+            finally:
+                if writer:
+                    writer.close()
+                    try:
+                        writer.transport.abort()
+                    except Exception:
+                        pass
+        return False
+
+
 async def check_tls_sni(ip, port, sni, timeout_val, sem):
     async with sem:
         writer = None
@@ -137,17 +168,10 @@ async def check_http(ip, port, host, timeout_val, sem):
                     pass
 
 
-async def stage1_worker(ip, port, sem, counter, lock, total):
-    ok = await check_tls_sni(ip, port, CF_SNI_1, STAGE1_TIMEOUT, sem)
-    async with lock:
-        counter[0] += 1
-        if counter[0] % 100000 == 0:
-            print(f"  [第一阶段] {counter[0]:,}/{total:,}", flush=True)
-    return (ip, port) if ok else None
-
-
 async def full_verify(ip, port, sem):
-    """第二、三阶段完整验证"""
+    """第一+二+三阶段完整验证"""
+    if not await check_tls_sni(ip, port, CF_SNI_1, STAGE1_TIMEOUT, sem):
+        return False
     if not await check_http(ip, port, CF_HOST_TEST, STAGE2_TIMEOUT, sem):
         return False
     if CUSTOM_CF_DOMAIN and CUSTOM_CF_DOMAIN.strip():
@@ -161,34 +185,41 @@ async def main():
     total = len(ips) * (PORT_END - PORT_START + 1)
     print(f"[*] 深挖：{len(ips)} 个种子 IP × 全端口({PORT_START}-{PORT_END}) = {total:,} 个目标", flush=True)
 
-    sem = asyncio.Semaphore(CONCURRENCY)
+    # ==================== 阶段零：TCP 探活 ====================
+    print(f"\n[0/3 阶段零 TCP 探活] 并发={TCP_CONCURRENCY} 超时={TCP_TIMEOUT}s 重试={TCP_RETRY}...", flush=True)
+    tcp_sem = asyncio.Semaphore(TCP_CONCURRENCY)
+
+    done = [0]
     lock = asyncio.Lock()
-    counter = [0]
 
-    # 第一阶段：全端口 TLS 探测
-    print("[1/3] 第一阶段 TLS 探测...", flush=True)
-    tasks = []
-    for ip in ips:
-        for port in range(PORT_START, PORT_END + 1):
-            tasks.append(stage1_worker(ip, port, sem, counter, lock, total))
-    results = await asyncio.gather(*tasks)
-    pass_1 = [r for r in results if r]
-    print(f"[+] 第一阶段通过: {len(pass_1)} 个", flush=True)
+    async def probe(ip, port):
+        ok = await tcp_alive(ip, port, tcp_sem)
+        async with lock:
+            done[0] += 1
+            if done[0] % 100000 == 0:
+                print(f"  [探活进度] {done[0]:,}/{total:,}", flush=True)
+        return (ip, port) if ok else None
 
-    if not pass_1:
-        print("[!] 无通过，结束。", flush=True)
+    tcp_tasks = [probe(ip, port) for ip in ips for port in range(PORT_START, PORT_END + 1)]
+    tcp_results = await asyncio.gather(*tcp_tasks)
+    open_ports = [r for r in tcp_results if r]
+    print(f"[+] TCP 探活完成！开放端口: {len(open_ports)} 个（过滤掉 {total - len(open_ports):,} 个关闭端口）", flush=True)
+
+    if not open_ports:
+        print("[!] 无开放端口，结束。", flush=True)
         with open("deep_result.txt", "w") as f:
             pass
         return
 
-    # 第二、三阶段验证
-    print(f"[2/3+3/3] 完整验证 {len(pass_1)} 个候选...", flush=True)
-    v_tasks = [full_verify(ip, port, sem) for ip, port in pass_1]
+    # ==================== 第一+二+三阶段：TLS 验证 ====================
+    print(f"\n[1-3/3 TLS 三阶段验证] 验证 {len(open_ports)} 个开放端口...", flush=True)
+    tls_sem = asyncio.Semaphore(TLS_CONCURRENCY)
+    v_tasks = [full_verify(ip, port, tls_sem) for ip, port in open_ports]
     v_res = await asyncio.gather(*v_tasks)
-    final = [pass_1[i] for i, ok in enumerate(v_res) if ok]
-    print(f"[+] 最终有效: {len(final)} 个", flush=True)
+    final = [open_ports[i] for i, ok in enumerate(v_res) if ok]
+    print(f"[+] 验证完成！最终有效: {len(final)} 个", flush=True)
 
-    # 输出，标签用 ASN
+    # ==================== 输出（标签用 ASN）====================
     lines = set()
     for ip, port in final:
         country = get_country(ip)
@@ -209,17 +240,28 @@ async def main():
         for line in sorted_lines:
             f.write(line + "\n")
 
-    # 按 IP 汇总打印，方便看规律
+    # ==================== 按 IP 汇总打印（看规律）====================
     print("\n==================== 深挖结果（按IP）====================", flush=True)
-    by_ip = {}
-    for ip, port in final:
-        by_ip.setdefault(ip, []).append(port)
-    for ip in ips:
-        ports = sorted(by_ip.get(ip, []))
-        tag = SEEDS[ip]
-        print(f"  {ip} [{tag}] → {ports if ports else '无'}", flush=True)
 
-    print(f"\n[+] 共 {len(sorted_lines)} 个有效，已存 deep_result.txt", flush=True)
+    # 开放端口按 IP 归类（TCP层面开着的，不一定过三阶段）
+    open_by_ip = {}
+    for ip, port in open_ports:
+        open_by_ip.setdefault(ip, []).append(port)
+
+    # 最终有效端口按 IP 归类（过了三阶段的）
+    valid_by_ip = {}
+    for ip, port in final:
+        valid_by_ip.setdefault(ip, []).append(port)
+
+    for ip in ips:
+        tag = SEEDS[ip]
+        opens = sorted(open_by_ip.get(ip, []))
+        valids = sorted(valid_by_ip.get(ip, []))
+        print(f"  {ip} [{tag}]", flush=True)
+        print(f"      TCP开放端口: {opens if opens else '无'}", flush=True)
+        print(f"      可用(过三阶段): {valids if valids else '无'}", flush=True)
+
+    print(f"\n[+] 共 {len(sorted_lines)} 个可用端口，已存 deep_result.txt", flush=True)
 
 
 if __name__ == "__main__":
