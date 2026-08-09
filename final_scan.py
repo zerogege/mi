@@ -8,31 +8,28 @@ import ipaddress
 import random
 import socket
 import urllib.request
+import urllib.parse
 from functools import lru_cache
 
 import geoip2.database
+import aiohttp
 
 # ==================== 配置 ====================
 CUSTOM_CF_DOMAIN = os.getenv("CUSTOM_CF_DOMAIN", "zeroo.ccwu.cc")
 GEOIP_DB = "GeoLite2-Country.mmdb"
 STATE_DIR = "state"
 
-CF_SNI_1 = "www.cloudflare.com"
-CF_HOST_TEST = "crypto.cloudflare.com"
+# 你自建的检测 API（用于最终验证）
+CHECK_API = "https://check.tigaa.ccwu.cc/check"
+API_CONCURRENCY = 10       # API 验证并发（你的CF扛得住）
+API_TIMEOUT = 20
 
-# TCP 探活（已验证不漏）
+# 阶段零：TCP 探活
 TCP_CONCURRENCY = 2500
 TCP_TIMEOUT = 2.0
 TCP_RETRY = 1
 BATCH_SIZE = 500000
 
-# TLS 三阶段
-TLS_CONCURRENCY = 300
-STAGE1_TIMEOUT = 3
-STAGE2_TIMEOUT = 2.5
-STAGE3_TIMEOUT = 2.5
-
-# 每次随机抽的端口数
 SAMPLE_N = 1800
 
 try:
@@ -61,7 +58,6 @@ def get_country(ip):
         return "??"
 
 
-# ==================== ASN 自动拉取 ====================
 @lru_cache(maxsize=32)
 def get_ips_from_asn(asn_clean):
     cidrs = []
@@ -101,7 +97,6 @@ def get_ips_from_asn(asn_clean):
     return ip_list
 
 
-# ==================== 状态管理 ====================
 def _asn_key(name_label):
     return re.sub(r'[^\w.-]', '_', name_label)
 
@@ -130,7 +125,6 @@ def save_scanned_ports(key, ports):
 
 
 def pick_ports(port_str, key):
-    """从范围随机抽 SAMPLE_N 个，排除已抽过的，抽完清空循环。"""
     parts = re.split(r'[\s,]+', str(port_str).strip())
     all_range = set()
     for part in parts:
@@ -144,35 +138,19 @@ def pick_ports(port_str, key):
                 continue
         elif part.isdigit():
             all_range.add(int(part))
-
     if not all_range:
         all_range = set(range(20000, 60001))
 
     scanned = load_scanned_ports(key)
     available = list(all_range - scanned)
     if len(available) < SAMPLE_N:
-        print(f"[*] {key} 端口区间已抽完，清空记录重新循环", flush=True)
+        print(f"[*] 端口区间已抽完，清空记录重新循环", flush=True)
         scanned = set()
         available = list(all_range)
     chosen = random.sample(available, min(SAMPLE_N, len(available)))
     scanned.update(chosen)
     save_scanned_ports(key, scanned)
     return sorted(chosen)
-
-
-def match_domain_in_cert(sni_domain, cert_str):
-    sni_domain = sni_domain.lower()
-    cert_str = cert_str.lower()
-    if sni_domain in cert_str:
-        return True
-    parts = sni_domain.split(".")
-    if len(parts) >= 2:
-        main_domain = ".".join(parts[-2:])
-        if main_domain in cert_str or f"*.{main_domain}" in cert_str:
-            return True
-    if "cloudflare" in sni_domain and "cloudflare" in cert_str:
-        return True
-    return False
 
 
 async def tcp_alive(ip, port, sem):
@@ -197,71 +175,26 @@ async def tcp_alive(ip, port, sem):
         return False
 
 
-async def check_tls_sni(ip, port, sni, timeout_val, sem):
+async def api_verify(session, ip, port, sem):
+    """用自建 API 验证，返回 (是否有效, 真实落地国家)"""
     async with sem:
-        writer = None
         try:
-            conn = asyncio.open_connection(ip, port, ssl=SSL_CTX, server_hostname=sni)
-            reader, writer = await asyncio.wait_for(conn, timeout=timeout_val)
-            sock = writer.get_extra_info('socket')
-            if sock:
-                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            ssl_obj = writer.get_extra_info('ssl_object')
-            if not ssl_obj:
-                return False
-            der_cert = ssl_obj.getpeercert(binary_form=True)
-            if not der_cert:
-                return False
-            cert_str = der_cert.decode('latin1', errors='ignore').lower()
-            return match_domain_in_cert(sni, cert_str)
+            url = f"{CHECK_API}?proxyip={urllib.parse.quote(f'{ip}:{port}')}"
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=API_TIMEOUT)) as resp:
+                data = await resp.json(content_type=None)
+                if data.get("success") is True:
+                    country = "??"
+                    try:
+                        country = data["probe_results"]["ipv4"]["exit"]["country"] or "??"
+                    except Exception:
+                        try:
+                            country = data["probe_results"]["ipv6"]["exit"]["country"] or "??"
+                        except Exception:
+                            pass
+                    return (True, country)
+                return (False, "??")
         except Exception:
-            return False
-        finally:
-            if writer:
-                writer.close()
-                try:
-                    writer.transport.abort()
-                except Exception:
-                    pass
-
-
-async def check_http(ip, port, host, timeout_val, sem):
-    async with sem:
-        writer = None
-        try:
-            conn = asyncio.open_connection(ip, port, ssl=SSL_CTX, server_hostname=host)
-            reader, writer = await asyncio.wait_for(conn, timeout=timeout_val)
-            sock = writer.get_extra_info('socket')
-            if sock:
-                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            req = f"GET / HTTP/1.1\r\nHost: {host}\r\nUser-Agent: Mozilla/5.0\r\nConnection: close\r\n\r\n"
-            writer.write(req.encode('latin1'))
-            await writer.drain()
-            data = await asyncio.wait_for(reader.read(512), timeout=timeout_val)
-            if not data:
-                return False
-            resp = data.decode('latin1', errors='ignore').lower()
-            return ("http/1.1 301" in resp or "http/1.1 302" in resp) and ("location:" in resp)
-        except Exception:
-            return False
-        finally:
-            if writer:
-                writer.close()
-                try:
-                    writer.transport.abort()
-                except Exception:
-                    pass
-
-
-async def full_verify(ip, port, sem):
-    if not await check_tls_sni(ip, port, CF_SNI_1, STAGE1_TIMEOUT, sem):
-        return False
-    if not await check_http(ip, port, CF_HOST_TEST, STAGE2_TIMEOUT, sem):
-        return False
-    if CUSTOM_CF_DOMAIN and CUSTOM_CF_DOMAIN.strip():
-        if not await check_tls_sni(ip, port, CUSTOM_CF_DOMAIN.strip(), STAGE3_TIMEOUT, sem):
-            return False
-    return True
+            return (False, "??")
 
 
 async def main():
@@ -272,8 +205,8 @@ async def main():
     key = _asn_key(name_label)
     asn_clean = asn_input.upper().replace("AS", "").strip()
 
-    # 1. 自动拉取 ASN 的所有 IP
-    print(f"[*] 拉取 AS{asn_clean} 的 IP 段...", flush=True)
+    # 1. 拉取 ASN 的 IP
+    print(f"[*] 拉取目标 ASN 的 IP 段...", flush=True)
     all_ips = get_ips_from_asn(asn_clean)
     if not all_ips:
         print("[-] 未拉取到 IP，退出。", flush=True)
@@ -285,18 +218,18 @@ async def main():
     random.shuffle(all_ips)
     print(f"[+] 拉取到 {len(all_ips)} 个 IP", flush=True)
 
-    # 2. 随机抽端口（状态记忆）
+    # 2. 随机抽端口
     ports = pick_ports(port_range, key)
-    print(f"[*] 本次随机抽取 {len(ports)} 个端口（区间 {port_range}）", flush=True)
+    print(f"[*] 本次随机抽取 {len(ports)} 个端口", flush=True)
 
     total = len(all_ips) * len(ports)
-    print(f"[*] {len(all_ips)} IP × {len(ports)} 端口 = {total:,} 个目标", flush=True)
+    print(f"[*] 共 {total:,} 个目标", flush=True)
 
     with open("name.txt", "w") as f:
         f.write(name_label)
 
     # 3. 阶段零：分批 TCP 探活
-    print(f"\n[0/3 TCP 探活] 并发={TCP_CONCURRENCY} 超时={TCP_TIMEOUT}s 重试={TCP_RETRY}...", flush=True)
+    print(f"\n[0/2 TCP 探活] 并发={TCP_CONCURRENCY} 超时={TCP_TIMEOUT}s 重试={TCP_RETRY}...", flush=True)
     tcp_sem = asyncio.Semaphore(TCP_CONCURRENCY)
 
     async def probe(ip, port):
@@ -331,15 +264,20 @@ async def main():
             f.write("0")
         return
 
-    # 4. TLS 三阶段验证
-    print(f"\n[1-3/3 TLS 验证] 验证 {len(open_ports)} 个开放端口...", flush=True)
-    tls_sem = asyncio.Semaphore(TLS_CONCURRENCY)
-    v_tasks = [full_verify(ip, port, tls_sem) for ip, port in open_ports]
-    v_res = await asyncio.gather(*v_tasks)
-    final = [open_ports[i] for i, ok in enumerate(v_res) if ok]
+    # 4. API 验证（替代三阶段，更准 + 拿真实落地）
+    print(f"\n[1/2 API 验证] 验证 {len(open_ports)} 个...", flush=True)
+    api_sem = asyncio.Semaphore(API_CONCURRENCY)
+    final = []  # [(ip, port, 真实落地国家)]
+    async with aiohttp.ClientSession() as session:
+        v_tasks = [api_verify(session, ip, port, api_sem) for ip, port in open_ports]
+        v_res = await asyncio.gather(*v_tasks)
+        for i, (ok, country) in enumerate(v_res):
+            if ok:
+                ip, port = open_ports[i]
+                final.append((ip, port, country))
     print(f"[+] 验证完成！有效: {len(final)} 个", flush=True)
 
-    # 5. 结果追加去重
+    # 5. 结果追加去重（地区用 API 真实落地）
     output_filename = f"{name_label}.txt"
     old_lines = set()
     try:
@@ -352,8 +290,7 @@ async def main():
         pass
 
     new_count = 0
-    for ip, port in final:
-        country = get_country(ip)
+    for ip, port, country in final:
         line = f"{ip}:{port}#{country} {name_label}"
         if line not in old_lines:
             new_count += 1
@@ -376,13 +313,10 @@ async def main():
     with open("count.txt", "w") as f:
         f.write(str(new_count))
 
+    # ==================== 脱敏输出（不打印具体 IP，只打数量）====================
     print("\n==================== 扫描结束 ====================", flush=True)
     print(f"本次新增: {new_count} 个 | 文件累计: {len(sorted_lines)} 个", flush=True)
-    if final:
-        print("本次有效端口:", flush=True)
-        for ip, port in sorted(final, key=lambda x: (x[0], x[1])):
-            print(f"  {ip}:{port}", flush=True)
-    print(f"[+] 已保存至 {output_filename}（追加去重）", flush=True)
+    print(f"[+] 已保存（结果详见私库）", flush=True)
 
 
 if __name__ == "__main__":
