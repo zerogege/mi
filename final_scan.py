@@ -19,9 +19,12 @@ CUSTOM_CF_DOMAIN = os.getenv("CUSTOM_CF_DOMAIN", "zeroo.ccwu.cc")
 GEOIP_DB = "GeoLite2-Country.mmdb"
 STATE_DIR = "state"
 
-# 你自建的检测 API（用于最终验证）
+CF_SNI_1 = "www.cloudflare.com"
+CF_HOST_TEST = "crypto.cloudflare.com"
+
+# 自建检测 API（只用于最终确认少量 final）
 CHECK_API = "https://check.tigaa.ccwu.cc/check"
-API_CONCURRENCY = 10       # API 验证并发（你的CF扛得住）
+API_CONCURRENCY = 10
 API_TIMEOUT = 20
 
 # 阶段零：TCP 探活
@@ -29,6 +32,12 @@ TCP_CONCURRENCY = 2500
 TCP_TIMEOUT = 2.0
 TCP_RETRY = 1
 BATCH_SIZE = 500000
+
+# 三阶段
+TLS_CONCURRENCY = 300
+STAGE1_TIMEOUT = 3
+STAGE2_TIMEOUT = 2.5
+STAGE3_TIMEOUT = 2.5
 
 SAMPLE_N = 1800
 
@@ -153,6 +162,21 @@ def pick_ports(port_str, key):
     return sorted(chosen)
 
 
+def match_domain_in_cert(sni_domain, cert_str):
+    sni_domain = sni_domain.lower()
+    cert_str = cert_str.lower()
+    if sni_domain in cert_str:
+        return True
+    parts = sni_domain.split(".")
+    if len(parts) >= 2:
+        main_domain = ".".join(parts[-2:])
+        if main_domain in cert_str or f"*.{main_domain}" in cert_str:
+            return True
+    if "cloudflare" in sni_domain and "cloudflare" in cert_str:
+        return True
+    return False
+
+
 async def tcp_alive(ip, port, sem):
     async with sem:
         for attempt in range(TCP_RETRY + 1):
@@ -175,8 +199,76 @@ async def tcp_alive(ip, port, sem):
         return False
 
 
+async def check_tls_sni(ip, port, sni, timeout_val, sem):
+    async with sem:
+        writer = None
+        try:
+            conn = asyncio.open_connection(ip, port, ssl=SSL_CTX, server_hostname=sni)
+            reader, writer = await asyncio.wait_for(conn, timeout=timeout_val)
+            sock = writer.get_extra_info('socket')
+            if sock:
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            ssl_obj = writer.get_extra_info('ssl_object')
+            if not ssl_obj:
+                return False
+            der_cert = ssl_obj.getpeercert(binary_form=True)
+            if not der_cert:
+                return False
+            cert_str = der_cert.decode('latin1', errors='ignore').lower()
+            return match_domain_in_cert(sni, cert_str)
+        except Exception:
+            return False
+        finally:
+            if writer:
+                writer.close()
+                try:
+                    writer.transport.abort()
+                except Exception:
+                    pass
+
+
+async def check_http(ip, port, host, timeout_val, sem):
+    async with sem:
+        writer = None
+        try:
+            conn = asyncio.open_connection(ip, port, ssl=SSL_CTX, server_hostname=host)
+            reader, writer = await asyncio.wait_for(conn, timeout=timeout_val)
+            sock = writer.get_extra_info('socket')
+            if sock:
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            req = f"GET / HTTP/1.1\r\nHost: {host}\r\nUser-Agent: Mozilla/5.0\r\nConnection: close\r\n\r\n"
+            writer.write(req.encode('latin1'))
+            await writer.drain()
+            data = await asyncio.wait_for(reader.read(512), timeout=timeout_val)
+            if not data:
+                return False
+            resp = data.decode('latin1', errors='ignore').lower()
+            return ("http/1.1 301" in resp or "http/1.1 302" in resp) and ("location:" in resp)
+        except Exception:
+            return False
+        finally:
+            if writer:
+                writer.close()
+                try:
+                    writer.transport.abort()
+                except Exception:
+                    pass
+
+
+async def full_verify(ip, port, sem):
+    """三阶段（本地，用于初筛）"""
+    if not await check_tls_sni(ip, port, CF_SNI_1, STAGE1_TIMEOUT, sem):
+        return False
+    if not await check_http(ip, port, CF_HOST_TEST, STAGE2_TIMEOUT, sem):
+        return False
+    if CUSTOM_CF_DOMAIN and CUSTOM_CF_DOMAIN.strip():
+        if not await check_tls_sni(ip, port, CUSTOM_CF_DOMAIN.strip(), STAGE3_TIMEOUT, sem):
+            return False
+    return True
+
+
 async def api_verify(session, ip, port, sem):
-    """用自建 API 验证，返回 (是否有效, 真实落地国家)"""
+    """API 确认（只用于三阶段筛后的少量 final）"""
     async with sem:
         try:
             url = f"{CHECK_API}?proxyip={urllib.parse.quote(f'{ip}:{port}')}"
@@ -264,20 +356,34 @@ async def main():
             f.write("0")
         return
 
-    # 4. API 验证（替代三阶段，更准 + 拿真实落地）
-    print(f"\n[1/2 API 验证] 验证 {len(open_ports)} 个...", flush=True)
+    # 4. 三阶段初筛（本地，把上万开放端口筛到少量，不耗API）
+    print(f"\n[1/2 三阶段初筛] 筛选 {len(open_ports)} 个...", flush=True)
+    tls_sem = asyncio.Semaphore(TLS_CONCURRENCY)
+    v_tasks = [full_verify(ip, port, tls_sem) for ip, port in open_ports]
+    v_res = await asyncio.gather(*v_tasks)
+    stage_passed = [open_ports[i] for i, ok in enumerate(v_res) if ok]
+    print(f"[+] 初筛通过: {len(stage_passed)} 个", flush=True)
+
+    if not stage_passed:
+        print("[-] 初筛无通过。", flush=True)
+        with open("count.txt", "w") as f:
+            f.write("0")
+        return
+
+    # 5. API 确认（只验证初筛后的少量，量小不打爆CF）+ 拿真实落地
+    print(f"\n[2/2 API 确认] 确认 {len(stage_passed)} 个...", flush=True)
     api_sem = asyncio.Semaphore(API_CONCURRENCY)
     final = []  # [(ip, port, 真实落地国家)]
     async with aiohttp.ClientSession() as session:
-        v_tasks = [api_verify(session, ip, port, api_sem) for ip, port in open_ports]
-        v_res = await asyncio.gather(*v_tasks)
-        for i, (ok, country) in enumerate(v_res):
+        a_tasks = [api_verify(session, ip, port, api_sem) for ip, port in stage_passed]
+        a_res = await asyncio.gather(*a_tasks)
+        for i, (ok, country) in enumerate(a_res):
             if ok:
-                ip, port = open_ports[i]
+                ip, port = stage_passed[i]
                 final.append((ip, port, country))
-    print(f"[+] 验证完成！有效: {len(final)} 个", flush=True)
+    print(f"[+] API 确认通过: {len(final)} 个", flush=True)
 
-    # 5. 结果追加去重（地区用 API 真实落地）
+    # 6. 结果追加去重（地区用 API 真实落地）
     output_filename = f"{name_label}.txt"
     old_lines = set()
     try:
@@ -313,7 +419,7 @@ async def main():
     with open("count.txt", "w") as f:
         f.write(str(new_count))
 
-    # ==================== 脱敏输出（不打印具体 IP，只打数量）====================
+    # ==================== 脱敏输出（不打印具体 IP）====================
     print("\n==================== 扫描结束 ====================", flush=True)
     print(f"本次新增: {new_count} 个 | 文件累计: {len(sorted_lines)} 个", flush=True)
     print(f"[+] 已保存（结果详见私库）", flush=True)
