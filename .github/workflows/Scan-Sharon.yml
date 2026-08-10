@@ -2,7 +2,7 @@ name: Scan Sharon
 on:
   workflow_dispatch:
   schedule:
-    - cron: '40 2,14 * * *'
+    - cron: '40 9,21 * * *'
     
 concurrency:
   group: scan-sharon
