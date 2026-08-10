@@ -43,22 +43,41 @@ jobs:
         run: |
           cd result_repo
           mkdir -p state
-          cp ../state/*.txt state/ 2>/dev/null || true
-          for f in ../*.txt; do
-            fn=$(basename "$f")
-            if [ "$fn" != "requirements.txt" ] && [ "$fn" != "count.txt" ] && [ "$fn" != "name.txt" ]; then
-              cp "$f" ./ 2>/dev/null || true
-            fi
-          done
+
+          # 只复制当前任务自己的文件，不再用通配符
+          cp ../Neburst.txt ./ 2>/dev/null || true
+          cp ../state/scanned_ports_Neburst.txt state/ 2>/dev/null || true
+
           git config user.email "bot@users.noreply.github.com"
           git config user.name "bot"
-          git add -A
+
+          git add Neburst.txt state/scanned_ports_Neburst.txt
+
           if git diff --staged --quiet; then
             echo "no change"
           else
             git commit -m "Neburst update"
-            git pull --rebase
-            git push
+
+            # 自动 rebase，冲突时用 sort -u 合并
+            for i in {1..5}; do
+              if git pull --rebase origin main; then
+                break
+              fi
+              if [ -d .git/rebase-merge ] || [ -d .git/rebase-apply ]; then
+                CONFLICTS=$(git diff --name-only --diff-filter=U)
+                if [ -n "$CONFLICTS" ]; then
+                  for f in $CONFLICTS; do
+                    sort -u "$f" -o "$f"
+                    git add "$f"
+                  done
+                fi
+                GIT_EDITOR=true git rebase --continue
+              else
+                sleep 2
+              fi
+            done
+
+            git push origin main
           fi
 
       - name: Backup to GitLab
