@@ -6,6 +6,8 @@ on:
 concurrency:
   group: scan-sharon
   cancel-in-progress: false
+
+  
 jobs:
   scan:
     runs-on: ubuntu-latest
