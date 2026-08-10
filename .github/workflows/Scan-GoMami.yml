@@ -3,7 +3,7 @@ name: Scan GoMami
 on:
   workflow_dispatch:
   schedule:
-    - cron: '20 2,14 * * *'
+    - cron: '20 5,17 * * *'
 
 concurrency:
   group: scan-gomami
