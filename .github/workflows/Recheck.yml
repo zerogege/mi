@@ -34,7 +34,7 @@ jobs:
           shopt -s nullglob
           FILES=""
           for f in *.txt; do
-            if [ "$f" != "requirements.txt" ] && [ "$f" != "count.txt" ] && [ "$f" != "name.txt" ] && [ "$f" != "ip.txt" ]; then
+            if [ "$f" != "requirements.txt" ] && [ "$f" != "count.txt" ] && [ "$f" != "name.txt" ] && [ "$f" != "ip.txt" ] && [ "$f" != "recheck_summary.txt" ]; then
               FILES="$FILES $f"
             fi
           done
@@ -44,6 +44,11 @@ jobs:
           else
             echo "没有可复验的文件"
           fi
+          # 显示摘要（如果有）
+          if [ -s recheck_summary.txt ]; then
+            echo "剔除摘要："
+            cat recheck_summary.txt
+          fi
 
       - name: Push back
         env:
@@ -52,7 +57,7 @@ jobs:
           cd result_repo
           for f in ../*.txt; do
             fn=$(basename "$f")
-            if [ "$fn" != "requirements.txt" ] && [ "$fn" != "count.txt" ] && [ "$fn" != "name.txt" ] && [ "$fn" != "ip.txt" ]; then
+            if [ "$fn" != "requirements.txt" ] && [ "$fn" != "count.txt" ] && [ "$fn" != "name.txt" ] && [ "$fn" != "ip.txt" ] && [ "$fn" != "recheck_summary.txt" ]; then
               cp "$f" ./ 2>/dev/null || true
             fi
           done
@@ -91,10 +96,15 @@ jobs:
       - name: Notify TG
         if: always()
         run: |
-          if [ "${{ job.status }}" = "success" ]; then
-            MSG="🔄 小号复验完成，已剔除失效IP"
+          if [ -s recheck_summary.txt ]; then
+            DETAILS=$(cat recheck_summary.txt | tr '\n' '，' | sed 's/，$//')
+            MSG="🔄 小号复验完成，已剔除失效IP：${DETAILS}"
           else
-            MSG="❌ 小号复验失败%0A状态: ${{ job.status }}"
+            if [ "${{ job.status }}" = "success" ]; then
+              MSG="🔄 小号复验完成，无失效IP需剔除"
+            else
+              MSG="❌ 小号复验失败%0A状态: ${{ job.status }}"
+            fi
           fi
           curl "https://api.telegram.org/bot${{ secrets.TG_TOKEN }}/sendMessage" \
             -d chat_id=${{ secrets.TG_CHAT_ID }} \
