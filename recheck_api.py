@@ -3,6 +3,7 @@ import sys
 import os
 import ipaddress
 import urllib.parse
+import json
 
 import aiohttp
 
@@ -59,6 +60,7 @@ async def main():
         return
 
     sem = asyncio.Semaphore(CONCURRENCY)
+    removed_summary = {}   # 保存“文件名: 剔除数量”
 
     async with aiohttp.ClientSession() as session:
         for fname in sys.argv[1:]:
@@ -66,7 +68,7 @@ async def main():
             if base.lower().replace(".txt", "").endswith("-old"):
                 print(f"[跳过] 备份文件: {fname}", flush=True)
                 continue
-            if base in ("count.txt", "name.txt", "requirements.txt", "ip.txt"):
+            if base in ("count.txt", "name.txt", "requirements.txt", "ip.txt", "recheck_summary.txt"):
                 continue
             if not os.path.exists(fname):
                 print(f"[-] 文件不存在: {fname}", flush=True)
@@ -102,6 +104,13 @@ async def main():
                 print(f"[!] 存活率低于 {MIN_SURVIVE_RATIO*100:.0f}%，疑似API异常，不覆盖 {fname}。", flush=True)
                 continue
 
+            removed = total - alive_count
+            # 只记录剔除数 > 0 的文件，便于 TG 通知
+            if removed > 0:
+                # 去掉 .txt 后缀，显示更友好
+                display_name = base[:-4] if base.endswith(".txt") else base
+                removed_summary[display_name] = removed
+
             out_lines = set()
             for ip, port, country, name in alive:
                 out_lines.add(f"{ip}:{port}#{country} {name}".rstrip())
@@ -120,7 +129,15 @@ async def main():
                 for line in sorted_lines:
                     f.write(line + "\n")
 
-            print(f"[+] {fname} 已更新：剔除 {total - alive_count} 个失效，保留 {alive_count} 个。", flush=True)
+            print(f"[+] {fname} 已更新：剔除 {removed} 个失效，保留 {alive_count} 个。", flush=True)
+
+    # 写摘要文件
+    with open("recheck_summary.txt", "w", encoding="utf-8") as f:
+        if removed_summary:
+            for name, count in removed_summary.items():
+                f.write(f"{name}:{count}\n")
+        else:
+            f.write("")   # 空文件
 
 
 if __name__ == "__main__":
