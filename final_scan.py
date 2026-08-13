@@ -24,8 +24,10 @@ CF_HOST_TEST = "crypto.cloudflare.com"
 
 # 自建检测 API（只用于最终确认少量）
 CHECK_API = "https://check.tigaa.ccwu.cc/check"
-API_CONCURRENCY = 10
-API_TIMEOUT = 20
+API_CONCURRENCY = 20      # 从 10 提到 20，抵消重试带来的耗时
+API_TIMEOUT = 30          # 从 20 提到 30，非标端口握手慢
+API_RETRY = 2             # 新增：API 异常时的重试次数
+PENDING_MAX_FAIL = 5      # 待确认队列里连续异常这么多轮 → 放弃
 
 # 阶段零：TCP 探活
 TCP_CONCURRENCY = 2500
@@ -39,7 +41,7 @@ STAGE1_TIMEOUT = 3
 STAGE2_TIMEOUT = 2.5
 STAGE3_TIMEOUT = 2.5
 
-# 每次随机抽的端口数（1000，不超时）
+# 每次随机抽的端口数
 SAMPLE_N = 1000
 
 try:
@@ -132,6 +134,47 @@ def save_scanned_ports(key, ports):
     with open(fname, "w") as f:
         for p in sorted(ports):
             f.write(f"{p}\n")
+
+
+# ============ 待确认队列：本地初筛已过、但 API 未答复的条目 ============
+def _pending_file(key):
+    return os.path.join(STATE_DIR, f"pending_{key}.txt")
+
+
+def load_pending(key):
+    """返回 {(ip, port): 连续异常次数}"""
+    res = {}
+    try:
+        with open(_pending_file(key), encoding="utf-8") as f:
+            for line in f:
+                s = line.strip()
+                if not s or s.startswith("#"):
+                    continue
+                parts = s.split("|")
+                try:
+                    ip_s, port_s = parts[0].rsplit(":", 1)
+                    ipaddress.ip_address(ip_s)
+                    port = int(port_s)
+                except Exception:
+                    continue
+                fail = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 1
+                res[(ip_s, port)] = fail
+    except FileNotFoundError:
+        pass
+    return res
+
+
+def save_pending(key, pending):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    fname = _pending_file(key)
+    tmp = fname + ".tmp"
+    rows = sorted(pending.items(),
+                  key=lambda x: (ipaddress.ip_address(x[0][0]), x[0][1]))
+    with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+        f.write("# ip:port|连续API异常次数（本地初筛已通过，等待API确认）\n")
+        for (ip, port), fail in rows:
+            f.write(f"{ip}:{port}|{fail}\n")
+    os.replace(tmp, fname)
 
 
 def pick_ports(port_str, key):
@@ -269,25 +312,50 @@ async def full_verify(ip, port, sem):
 
 
 async def api_verify(session, ip, port, sem):
-    """API 确认（只用于初筛后的少量）"""
+    """API 确认。返回 ("ok", country) / ("dead", "??") / ("error", "??")
+
+    关键：区分"API 明确说不通"和"API 自己没答上来"，后者不判死。
+    """
     async with sem:
-        try:
-            url = f"{CHECK_API}?proxyip={urllib.parse.quote(f'{ip}:{port}')}"
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=API_TIMEOUT)) as resp:
-                data = await resp.json(content_type=None)
-                if data.get("success") is True:
-                    country = "??"
+        url = f"{CHECK_API}?proxyip={urllib.parse.quote(f'{ip}:{port}')}"
+        for attempt in range(API_RETRY + 1):
+            try:
+                async with session.get(
+                    url, timeout=aiohttp.ClientTimeout(total=API_TIMEOUT)
+                ) as resp:
+                    if resp.status != 200:
+                        if attempt < API_RETRY:
+                            await asyncio.sleep(2 * (attempt + 1))
+                            continue
+                        return ("error", "??")
+                    ctype = (resp.headers.get("content-type") or "").lower()
+                    if "json" not in ctype:
+                        # CF 错误页（1027 超额 / 1102 超限）是 text/html，不是 Worker 在应答
+                        if attempt < API_RETRY:
+                            await asyncio.sleep(2 * (attempt + 1))
+                            continue
+                        return ("error", "??")
+                    data = await resp.json(content_type=None)
+            except Exception:
+                if attempt < API_RETRY:
+                    await asyncio.sleep(2 * (attempt + 1))
+                    continue
+                return ("error", "??")
+
+            # 到这里说明 Worker 正常应答了，success 字段可信
+            if data.get("success") is True:
+                country = "??"
+                for fam in ("ipv4", "ipv6"):
                     try:
-                        country = data["probe_results"]["ipv4"]["exit"]["country"] or "??"
+                        c = data["probe_results"][fam]["exit"]["country"]
+                        if c:
+                            country = c
+                            break
                     except Exception:
-                        try:
-                            country = data["probe_results"]["ipv6"]["exit"]["country"] or "??"
-                        except Exception:
-                            pass
-                    return (True, country)
-                return (False, "??")
-        except Exception:
-            return (False, "??")
+                        continue
+                return ("ok", country)
+            return ("dead", "??")
+        return ("error", "??")
 
 
 async def main():
@@ -298,6 +366,14 @@ async def main():
     key = _asn_key(name_label)
     asn_clean = asn_input.upper().replace("AS", "").strip()
 
+    with open("name.txt", "w") as f:
+        f.write(name_label)
+
+    # 上轮遗留的待确认条目
+    pending = load_pending(key)
+    if pending:
+        print(f"[*] 待确认队列: {len(pending)} 条（上轮 API 异常未判定）", flush=True)
+
     # 1. 拉取 ASN 的 IP
     print(f"[*] 拉取目标 ASN 的 IP 段...", flush=True)
     all_ips = get_ips_from_asn(asn_clean)
@@ -305,8 +381,6 @@ async def main():
         print("[-] 未拉取到 IP，退出。", flush=True)
         with open("count.txt", "w") as f:
             f.write("0")
-        with open("name.txt", "w") as f:
-            f.write(name_label)
         return
     random.shuffle(all_ips)
     print(f"[+] 拉取到 {len(all_ips)} 个 IP", flush=True)
@@ -317,9 +391,6 @@ async def main():
 
     total = len(all_ips) * len(ports)
     print(f"[*] 共 {total:,} 个目标", flush=True)
-
-    with open("name.txt", "w") as f:
-        f.write(name_label)
 
     # 3. 阶段零：分批 TCP 探活
     print(f"\n[0/2 TCP 探活] 并发={TCP_CONCURRENCY} 超时={TCP_TIMEOUT}s 重试={TCP_RETRY}...", flush=True)
@@ -351,38 +422,68 @@ async def main():
 
     print(f"[+] 探活完成！开放: {len(open_ports)} 个（过滤 {total - len(open_ports):,} 个）", flush=True)
 
-    if not open_ports:
-        print("[-] 无开放端口。", flush=True)
-        with open("count.txt", "w") as f:
-            f.write("0")
-        return
+    # 4. 三阶段初筛
+    stage_passed = []
+    if open_ports:
+        print(f"\n[1/2 三阶段初筛] 筛选 {len(open_ports)} 个...", flush=True)
+        tls_sem = asyncio.Semaphore(TLS_CONCURRENCY)
+        v_tasks = [full_verify(ip, port, tls_sem) for ip, port in open_ports]
+        v_res = await asyncio.gather(*v_tasks)
+        stage_passed = [open_ports[i] for i, ok in enumerate(v_res) if ok]
+        print(f"[+] 初筛通过: {len(stage_passed)} 个", flush=True)
+    else:
+        print("[-] 无开放端口，跳过初筛。", flush=True)
 
-    # 4. 三阶段初筛（本地，把开放端口筛到少量，不耗API）
-    print(f"\n[1/2 三阶段初筛] 筛选 {len(open_ports)} 个...", flush=True)
-    tls_sem = asyncio.Semaphore(TLS_CONCURRENCY)
-    v_tasks = [full_verify(ip, port, tls_sem) for ip, port in open_ports]
-    v_res = await asyncio.gather(*v_tasks)
-    stage_passed = [open_ports[i] for i, ok in enumerate(v_res) if ok]
-    print(f"[+] 初筛通过: {len(stage_passed)} 个", flush=True)
+    # 5. API 确认：本轮初筛通过的 + 上轮遗留的待确认（合并去重）
+    verify_set = {(ip, port) for ip, port in stage_passed}
+    verify_set |= set(pending.keys())
+    verify_list = sorted(verify_set, key=lambda x: (ipaddress.ip_address(x[0]), x[1]))
 
-    if not stage_passed:
-        print("[-] 初筛无通过。", flush=True)
-        with open("count.txt", "w") as f:
-            f.write("0")
-        return
-
-    # 5. API 确认（只验证初筛后的少量）+ 拿真实落地
-    print(f"\n[2/2 API 确认] 确认 {len(stage_passed)} 个...", flush=True)
-    api_sem = asyncio.Semaphore(API_CONCURRENCY)
     final = []
-    async with aiohttp.ClientSession() as session:
-        a_tasks = [api_verify(session, ip, port, api_sem) for ip, port in stage_passed]
-        a_res = await asyncio.gather(*a_tasks)
-        for i, (ok, country) in enumerate(a_res):
-            if ok:
-                ip, port = stage_passed[i]
+    if verify_list:
+        print(f"\n[2/2 API 确认] 确认 {len(verify_list)} 个"
+              f"（本轮初筛 {len(stage_passed)} + 遗留 {len(pending)}，去重后）...", flush=True)
+        api_sem = asyncio.Semaphore(API_CONCURRENCY)
+        async with aiohttp.ClientSession() as session:
+            a_res = await asyncio.gather(
+                *[api_verify(session, ip, port, api_sem) for ip, port in verify_list]
+            )
+
+        dead_n = 0
+        err_now = []
+        gave_up = []
+        for (ip, port), (st, country) in zip(verify_list, a_res):
+            k = (ip, port)
+            if st == "ok":
                 final.append((ip, port, country))
-    print(f"[+] API 确认通过: {len(final)} 个", flush=True)
+                pending.pop(k, None)
+            elif st == "dead":
+                dead_n += 1
+                pending.pop(k, None)          # API 明确说不通，不再挂账
+            else:
+                fail = pending.get(k, 0) + 1
+                if fail >= PENDING_MAX_FAIL:
+                    gave_up.append(k)
+                    pending.pop(k, None)
+                else:
+                    pending[k] = fail
+                    err_now.append(k)
+
+        print(f"[+] 通过: {len(final)} | 明确不通: {dead_n} | "
+              f"API异常待下轮: {len(err_now)} | 放弃: {len(gave_up)}", flush=True)
+        if err_now:
+            print(f"[!] 以下条目本地初筛已通过，但 API 重试 {API_RETRY} 次仍未答复，"
+                  f"已挂入待确认队列，下轮自动补验：", flush=True)
+            for ip, port in err_now:
+                print(f"    ? {ip}:{port} (第 {pending[(ip, port)]} 次)", flush=True)
+        if gave_up:
+            print(f"[!] 连续 {PENDING_MAX_FAIL} 轮 API 异常，放弃：", flush=True)
+            for ip, port in gave_up:
+                print(f"    x {ip}:{port}", flush=True)
+    else:
+        print("[-] 无需 API 确认。", flush=True)
+
+    save_pending(key, pending)
 
     # 6. 读旧结果 + 合并新结果
     output_filename = f"{name_label}.txt"
@@ -417,9 +518,9 @@ async def main():
     sorted_lines = sorted(old_lines, key=sort_key)
 
     # ==================== 防覆盖保护 ====================
-    # 合并后结果远少于原有 → 疑似异常（如Pull失败没读到旧结果）→ 不覆盖
     if old_count > 20 and len(sorted_lines) < old_count * 0.5:
-        print(f"[!] 合并后结果({len(sorted_lines)})远少于原有({old_count})，疑似读取异常，跳过写入，不覆盖！", flush=True)
+        print(f"[!] 合并后结果({len(sorted_lines)})远少于原有({old_count})，"
+              f"疑似读取异常，跳过写入，不覆盖！", flush=True)
         with open("count.txt", "w") as f:
             f.write("0")
         return
@@ -432,9 +533,9 @@ async def main():
     with open("count.txt", "w") as f:
         f.write(str(new_count))
 
-    # ==================== 脱敏输出 ====================
     print("\n==================== 扫描结束 ====================", flush=True)
-    print(f"本次新增: {new_count} 个 | 文件累计: {len(sorted_lines)} 个", flush=True)
+    print(f"本次新增: {new_count} 个 | 文件累计: {len(sorted_lines)} 个 | "
+          f"待确认队列: {len(pending)} 条", flush=True)
     print(f"[+] 已保存（结果详见私库）", flush=True)
 
 
