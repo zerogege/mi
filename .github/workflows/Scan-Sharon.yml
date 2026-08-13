@@ -4,11 +4,11 @@ on:
   workflow_dispatch:
   schedule:
     - cron: '40 9,21 * * *'
-    
+
 concurrency:
   group: scan-sharon
   cancel-in-progress: false
-  
+
 jobs:
   scan:
     runs-on: ubuntu-latest
@@ -22,7 +22,7 @@ jobs:
           python-version: '3.10'
       - run: pip install -r requirements.txt
       - run: curl -L -o GeoLite2-Country.mmdb https://github.com/P3TERX/GeoLite.mmdb/raw/download/GeoLite2-Country.mmdb
-      
+
       - name: Pull state
         env:
           TOKEN: ${{ secrets.RESULT_REPO_TOKEN }}
@@ -31,12 +31,12 @@ jobs:
           mkdir -p state
           cp result_repo/state/*.txt state/ 2>/dev/null || true
           cp result_repo/*.txt ./ 2>/dev/null || true
-          
+
       - name: Run Scan
         env:
           CUSTOM_CF_DOMAIN: ${{ secrets.CUSTOM_CF_DOMAIN }}
         run: python final_scan.py "396856" "Sharon" "20000-60000"
-        
+
       - name: Push
         env:
           TOKEN: ${{ secrets.RESULT_REPO_TOKEN }}
@@ -47,11 +47,15 @@ jobs:
           # 只复制当前任务自己的文件，不再用通配符
           cp ../Sharon.txt ./ 2>/dev/null || true
           cp ../state/scanned_ports_Sharon.txt state/ 2>/dev/null || true
+          cp ../state/pending_Sharon.txt state/ 2>/dev/null || true
 
           git config user.email "bot@users.noreply.github.com"
           git config user.name "bot"
 
-          git add Sharon.txt state/scanned_ports_Sharon.txt
+          # 分开 add 并容错：首次运行时 pending 文件可能还不存在
+          git add Sharon.txt || true
+          git add state/scanned_ports_Sharon.txt || true
+          git add state/pending_Sharon.txt || true
 
           if git diff --staged --quiet; then
             echo "no change"
@@ -79,7 +83,7 @@ jobs:
 
             git push origin main
           fi
-          
+
       - name: Backup to GitLab
         if: always()
         env:
