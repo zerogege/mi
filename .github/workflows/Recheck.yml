@@ -3,7 +3,7 @@ name: Recheck IPs
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 8 * * */2'   # 每2天一次，UTC 8点（北京16点），非标货短命，复验勤点
+    - cron: '0 8 */2 * *'   # 每2天一次，UTC 8:00（北京 16:00）
 
 concurrency:
   group: recheck
@@ -97,15 +97,19 @@ jobs:
         if: always()
         run: |
           if [ -s recheck_summary.txt ]; then
-            DETAILS=$(cat recheck_summary.txt | tr '\n' '，' | sed 's/，$//')
-            MSG="🔄 小号复验完成，已剔除失效IP：${DETAILS}"
+            DETAILS=$(awk -F: '
+              { total += $2; printf "  • %s：%s 个\n", $1, $2 }
+              END { printf "合计剔除 %d 个", total }
+            ' recheck_summary.txt)
+            MSG=$(printf '🔄 小号复验完成，已剔除失效IP：\n%s' "$DETAILS")
           else
             if [ "${{ job.status }}" = "success" ]; then
               MSG="🔄 小号复验完成，无失效IP需剔除"
             else
-              MSG="❌ 小号复验失败%0A状态: ${{ job.status }}"
+              MSG=$(printf '❌ 小号复验失败\n状态: %s' "${{ job.status }}")
             fi
           fi
-          curl "https://api.telegram.org/bot${{ secrets.TG_TOKEN }}/sendMessage" \
-            -d chat_id=${{ secrets.TG_CHAT_ID }} \
-            -d text="${MSG}"
+          curl -sS -X POST \
+            "https://api.telegram.org/bot${{ secrets.TG_TOKEN }}/sendMessage" \
+            --data-urlencode "chat_id=${{ secrets.TG_CHAT_ID }}" \
+            --data-urlencode "text=${MSG}"
