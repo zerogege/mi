@@ -3,18 +3,23 @@ import sys
 import os
 import ipaddress
 import urllib.parse
-import json
 
 import aiohttp
 
 # ==================== 配置 ====================
 CHECK_API = "https://check.tigaa.ccwu.cc/check"
-CONCURRENCY = 10
-TIMEOUT = 20
+CONCURRENCY = 20              # 从 10 提到 20，抵消重试带来的耗时
+TIMEOUT = 30                  # 从 20 提到 30，非标端口握手慢
+API_RETRY = 2                 # 新增：API 异常时的重试次数
 MIN_SURVIVE_RATIO = 0.15
+API_ERROR_ABORT_RATIO = 0.3   # API异常占比超过此值 → 判定故障，整个文件不动
+
+SKIP_FILES = {"count.txt", "name.txt", "requirements.txt",
+              "ip.txt", "recheck_summary.txt"}
 
 
 def parse_line(line):
+    """返回 (ip, port, country, name)，country 用于 API 异常时原样保留"""
     s = line.strip()
     if not s:
         return None
@@ -23,35 +28,72 @@ def parse_line(line):
         ip_part, port_part = addr.rsplit(":", 1)
         ipaddress.ip_address(ip_part)
         port = int(port_part)
-        name = ""
+        country, name = "??", ""
         if "#" in s:
             after = s.split("#", 1)[1].split(None, 1)
+            if after:
+                country = after[0] or "??"
             name = after[1] if len(after) > 1 else ""
-        return (ip_part, port, name)
+        return (ip_part, port, country, name)
     except Exception:
         return None
 
 
 async def check_one(session, ip, port, sem):
+    """返回 ("ok", country) / ("dead", "??") / ("error", "??")
+
+    关键：区分"API 明确说不通"和"API 自己没答上来"，后者不删除。
+    """
     async with sem:
-        proxyip = urllib.parse.quote(f"{ip}:{port}")
-        url = f"{CHECK_API}?proxyip={proxyip}"
-        try:
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=TIMEOUT)) as resp:
-                data = await resp.json(content_type=None)
-                if data.get("success") is True:
-                    country = "??"
+        url = f"{CHECK_API}?proxyip={urllib.parse.quote(f'{ip}:{port}')}"
+        for attempt in range(API_RETRY + 1):
+            try:
+                async with session.get(
+                    url, timeout=aiohttp.ClientTimeout(total=TIMEOUT)
+                ) as resp:
+                    if resp.status != 200:
+                        if attempt < API_RETRY:
+                            await asyncio.sleep(2 * (attempt + 1))
+                            continue
+                        return ("error", "??")
+                    ctype = (resp.headers.get("content-type") or "").lower()
+                    if "json" not in ctype:
+                        # CF 错误页（1027 超额 / 1102 超限）是 text/html
+                        if attempt < API_RETRY:
+                            await asyncio.sleep(2 * (attempt + 1))
+                            continue
+                        return ("error", "??")
+                    data = await resp.json(content_type=None)
+            except Exception:
+                if attempt < API_RETRY:
+                    await asyncio.sleep(2 * (attempt + 1))
+                    continue
+                return ("error", "??")
+
+            # Worker 正常应答，success 字段可信
+            if data.get("success") is True:
+                country = "??"
+                for fam in ("ipv4", "ipv6"):
                     try:
-                        country = data["probe_results"]["ipv4"]["exit"]["country"] or "??"
+                        c = data["probe_results"][fam]["exit"]["country"]
+                        if c:
+                            country = c
+                            break
                     except Exception:
-                        try:
-                            country = data["probe_results"]["ipv6"]["exit"]["country"] or "??"
-                        except Exception:
-                            pass
-                    return (True, country)
-                return (False, "??")
-        except Exception:
-            return (False, "??")
+                        continue
+                return ("ok", country)
+            return ("dead", "??")
+        return ("error", "??")
+
+
+def sort_key(line):
+    try:
+        addr = line.split("#")[0]
+        ip_part, port_part = addr.rsplit(":", 1)
+        country = line.split("#")[1].split()[0] if "#" in line else "??"
+        return (country, ipaddress.ip_address(ip_part), int(port_part))
+    except Exception:
+        return ("??", ipaddress.ip_address("0.0.0.0"), 0)
 
 
 async def main():
@@ -60,15 +102,16 @@ async def main():
         return
 
     sem = asyncio.Semaphore(CONCURRENCY)
-    removed_summary = {}   # 保存“文件名: 剔除数量”
+    removed_summary = {}
 
     async with aiohttp.ClientSession() as session:
         for fname in sys.argv[1:]:
             base = os.path.basename(fname)
-            if base.lower().replace(".txt", "").endswith("-old"):
+            stem = base[:-4] if base.lower().endswith(".txt") else base
+            if stem.lower().endswith("-old"):
                 print(f"[跳过] 备份文件: {fname}", flush=True)
                 continue
-            if base in ("count.txt", "name.txt", "requirements.txt", "ip.txt", "recheck_summary.txt"):
+            if base in SKIP_FILES:
                 continue
             if not os.path.exists(fname):
                 print(f"[-] 文件不存在: {fname}", flush=True)
@@ -86,58 +129,64 @@ async def main():
                 print(f"[!] {fname} 无有效行，跳过。", flush=True)
                 continue
 
-            print(f"\n[*] 复验 {fname}：共 {total} 条（自建API，并发{CONCURRENCY}）...", flush=True)
-            tasks = [check_one(session, ip, port, sem) for ip, port, _ in items]
-            results = await asyncio.gather(*tasks)
+            print(f"\n[*] 复验 {fname}：共 {total} 条（并发{CONCURRENCY} "
+                  f"超时{TIMEOUT}s 重试{API_RETRY}）...", flush=True)
+            results = await asyncio.gather(
+                *[check_one(session, ip, port, sem) for ip, port, _, _ in items]
+            )
 
-            alive = []
-            for i, (ok, country) in enumerate(results):
-                if ok:
-                    ip, port, name = items[i]
+            alive, dead, unknown = [], [], []
+            for i, (st, country) in enumerate(results):
+                ip, port, old_country, name = items[i]
+                if st == "ok":
                     alive.append((ip, port, country, name))
+                elif st == "dead":
+                    dead.append((ip, port, name))
+                else:
+                    # API 没答上来 → 原样保留，沿用旧 country，下轮再判
+                    unknown.append((ip, port, old_country, name))
 
             alive_count = len(alive)
-            ratio = alive_count / total if total else 0
-            print(f"[+] {fname}：存活 {alive_count}/{total} ({ratio*100:.1f}%)", flush=True)
+            err_ratio = len(unknown) / total
+            print(f"[+] {fname}：存活 {alive_count} / 失效 {len(dead)} / "
+                  f"API异常 {len(unknown)}（共 {total}）", flush=True)
 
-            if ratio < MIN_SURVIVE_RATIO:
-                print(f"[!] 存活率低于 {MIN_SURVIVE_RATIO*100:.0f}%，疑似API异常，不覆盖 {fname}。", flush=True)
+            # 保护一：API 异常占比过高 → 整个文件不动
+            if err_ratio > API_ERROR_ABORT_RATIO:
+                print(f"[!] API 异常占比 {err_ratio*100:.1f}%，疑似 API 故障"
+                      f"（超额/1027/Worker异常），跳过 {fname}，不做任何变更。", flush=True)
                 continue
 
-            removed = total - alive_count
-            # 只记录剔除数 > 0 的文件，便于 TG 通知
+            # 保护二：存活率过低 → 不覆盖（分母排除 API 异常的）
+            judged = alive_count + len(dead)
+            if judged and alive_count / judged < MIN_SURVIVE_RATIO:
+                print(f"[!] 存活率低于 {MIN_SURVIVE_RATIO*100:.0f}%，"
+                      f"疑似异常，不覆盖 {fname}。", flush=True)
+                continue
+
+            removed = len(dead)
             if removed > 0:
-                # 去掉 .txt 后缀，显示更友好
-                display_name = base[:-4] if base.endswith(".txt") else base
-                removed_summary[display_name] = removed
+                removed_summary[stem] = removed
+                print(f"  [剔除明细]", flush=True)
+                for ip, port, _ in dead:
+                    print(f"    - {ip}:{port}", flush=True)
 
             out_lines = set()
             for ip, port, country, name in alive:
                 out_lines.add(f"{ip}:{port}#{country} {name}".rstrip())
+            for ip, port, country, name in unknown:
+                out_lines.add(f"{ip}:{port}#{country} {name}".rstrip())
 
-            def sort_key(line):
-                try:
-                    addr = line.split("#")[0]
-                    ip_part, port_part = addr.rsplit(":", 1)
-                    country = line.split("#")[1].split()[0] if "#" in line else "??"
-                    return (country, ipaddress.ip_address(ip_part), int(port_part))
-                except Exception:
-                    return ("??", ipaddress.ip_address("0.0.0.0"), 0)
-
-            sorted_lines = sorted(out_lines, key=sort_key)
             with open(fname, "w", encoding="utf-8", newline="\n") as f:
-                for line in sorted_lines:
+                for line in sorted(out_lines, key=sort_key):
                     f.write(line + "\n")
 
-            print(f"[+] {fname} 已更新：剔除 {removed} 个失效，保留 {alive_count} 个。", flush=True)
+            print(f"[+] {fname} 已更新：剔除 {removed} 个失效，"
+                  f"保留 {len(out_lines)} 个（含 {len(unknown)} 个待下轮复验）。", flush=True)
 
-    # 写摘要文件
     with open("recheck_summary.txt", "w", encoding="utf-8") as f:
-        if removed_summary:
-            for name, count in removed_summary.items():
-                f.write(f"{name}:{count}\n")
-        else:
-            f.write("")   # 空文件
+        for name, count in removed_summary.items():
+            f.write(f"{name}:{count}\n")
 
 
 if __name__ == "__main__":
