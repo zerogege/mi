@@ -47,11 +47,15 @@ jobs:
           # 只复制当前任务自己的文件，不再用通配符
           cp ../Neburst.txt ./ 2>/dev/null || true
           cp ../state/scanned_ports_Neburst.txt state/ 2>/dev/null || true
+          cp ../state/pending_Neburst.txt state/ 2>/dev/null || true
 
           git config user.email "bot@users.noreply.github.com"
           git config user.name "bot"
 
-          git add Neburst.txt state/scanned_ports_Neburst.txt
+          # 分开 add 并容错：首次运行时 pending 文件可能还不存在
+          git add Neburst.txt || true
+          git add state/scanned_ports_Neburst.txt || true
+          git add state/pending_Neburst.txt || true
 
           if git diff --staged --quiet; then
             echo "no change"
