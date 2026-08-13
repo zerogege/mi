@@ -26,20 +26,26 @@ CF_HOST_TEST = "crypto.cloudflare.com"
 CHECK_API = "https://check.tigaa.ccwu.cc/check"
 API_CONCURRENCY = 20      # 从 10 提到 20，抵消重试带来的耗时
 API_TIMEOUT = 30          # 从 20 提到 30，非标端口握手慢
-API_RETRY = 2             # 新增：API 异常时的重试次数
+API_RETRY = 2             # API 异常时的重试次数
 PENDING_MAX_FAIL = 5      # 待确认队列里连续异常这么多轮 → 放弃
 
 # 阶段零：TCP 探活
 TCP_CONCURRENCY = 2500
-TCP_TIMEOUT = 2.0
-TCP_RETRY = 1
+TCP_TIMEOUT = 3.0         # 2.0 偏紧：跨洲握手 200-400ms，稍排队就超
+TCP_RETRY = 0             # 立刻重试无效（拥塞不会在几十毫秒内消失），预算给下面的补扫
 BATCH_SIZE = 500000
+
+# 阶段零点五：二次补扫（低并发 + 长超时，专治主扫被限速漏掉的）
+RESCAN_CONCURRENCY = 200
+RESCAN_TIMEOUT = 6.0
+RESCAN_MAX_TARGETS = 60000   # 33.3个/秒 → 上限约 30 分钟
 
 # 三阶段
 TLS_CONCURRENCY = 300
 STAGE1_TIMEOUT = 3
 STAGE2_TIMEOUT = 2.5
 STAGE3_TIMEOUT = 2.5
+TLS_RETRY = 1             # 仅在"握手未完成"时重试，"明确不符"不重试
 
 # 每次随机抽的端口数
 SAMPLE_N = 1000
@@ -231,6 +237,7 @@ async def tcp_alive(ip, port, sem):
                 return True
             except Exception:
                 if attempt < TCP_RETRY:
+                    await asyncio.sleep(0.5 + random.random())   # 退避，让拥塞消散
                     continue
                 return False
             finally:
@@ -244,6 +251,7 @@ async def tcp_alive(ip, port, sem):
 
 
 async def check_tls_sni(ip, port, sni, timeout_val, sem):
+    """True=证书匹配 / False=明确不匹配 / None=握手未完成（可重试）"""
     async with sem:
         writer = None
         try:
@@ -254,14 +262,14 @@ async def check_tls_sni(ip, port, sni, timeout_val, sem):
                 sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             ssl_obj = writer.get_extra_info('ssl_object')
             if not ssl_obj:
-                return False
+                return None
             der_cert = ssl_obj.getpeercert(binary_form=True)
             if not der_cert:
-                return False
+                return None
             cert_str = der_cert.decode('latin1', errors='ignore').lower()
-            return match_domain_in_cert(sni, cert_str)
+            return match_domain_in_cert(sni, cert_str)       # True / False
         except Exception:
-            return False
+            return None                                       # 超时/重置/握手失败
         finally:
             if writer:
                 writer.close()
@@ -272,6 +280,7 @@ async def check_tls_sni(ip, port, sni, timeout_val, sem):
 
 
 async def check_http(ip, port, host, timeout_val, sem):
+    """True=拿到301/302 / False=拿到响应但不符 / None=没拿到响应（可重试）"""
     async with sem:
         writer = None
         try:
@@ -280,16 +289,18 @@ async def check_http(ip, port, host, timeout_val, sem):
             sock = writer.get_extra_info('socket')
             if sock:
                 sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            req = f"GET / HTTP/1.1\r\nHost: {host}\r\nUser-Agent: Mozilla/5.0\r\nConnection: close\r\n\r\n"
+            req = (f"GET / HTTP/1.1\r\nHost: {host}\r\nUser-Agent: Mozilla/5.0\r\n"
+                   f"Connection: close\r\n\r\n")
             writer.write(req.encode('latin1'))
             await writer.drain()
             data = await asyncio.wait_for(reader.read(512), timeout=timeout_val)
             if not data:
-                return False
+                return None
             resp = data.decode('latin1', errors='ignore').lower()
-            return ("http/1.1 301" in resp or "http/1.1 302" in resp) and ("location:" in resp)
+            return (("http/1.1 301" in resp or "http/1.1 302" in resp)
+                    and ("location:" in resp))
         except Exception:
-            return False
+            return None
         finally:
             if writer:
                 writer.close()
@@ -300,15 +311,30 @@ async def check_http(ip, port, host, timeout_val, sem):
 
 
 async def full_verify(ip, port, sem):
-    """三阶段（本地初筛）"""
-    if not await check_tls_sni(ip, port, CF_SNI_1, STAGE1_TIMEOUT, sem):
-        return False
-    if not await check_http(ip, port, CF_HOST_TEST, STAGE2_TIMEOUT, sem):
-        return False
-    if CUSTOM_CF_DOMAIN and CUSTOM_CF_DOMAIN.strip():
-        if not await check_tls_sni(ip, port, CUSTOM_CF_DOMAIN.strip(), STAGE3_TIMEOUT, sem):
-            return False
-    return True
+    """三阶段本地初筛。只对"握手未完成"重试，"明确不符"立即放弃（省时间）"""
+    custom = CUSTOM_CF_DOMAIN.strip() if CUSTOM_CF_DOMAIN else ""
+    stages = (
+        (check_tls_sni, CF_SNI_1,      STAGE1_TIMEOUT),
+        (check_http,    CF_HOST_TEST,  STAGE2_TIMEOUT),
+        (check_tls_sni, custom,        STAGE3_TIMEOUT),
+    )
+
+    for attempt in range(TLS_RETRY + 1):
+        retry_needed = False
+        for check, arg, tmo in stages:
+            if not arg:                      # 自定义域名为空 → 跳过第三阶段
+                continue
+            r = await check(ip, port, arg, tmo, sem)
+            if r is False:
+                return False                 # 明确不符，不重试
+            if r is None:
+                retry_needed = True
+                break                        # 握手未完成，跳出去重试
+        if not retry_needed:
+            return True
+        if attempt < TLS_RETRY:
+            await asyncio.sleep(0.5 + random.random())
+    return False
 
 
 async def api_verify(session, ip, port, sem):
@@ -393,7 +419,8 @@ async def main():
     print(f"[*] 共 {total:,} 个目标", flush=True)
 
     # 3. 阶段零：分批 TCP 探活
-    print(f"\n[0/2 TCP 探活] 并发={TCP_CONCURRENCY} 超时={TCP_TIMEOUT}s 重试={TCP_RETRY}...", flush=True)
+    print(f"\n[0/2 TCP 探活] 并发={TCP_CONCURRENCY} 超时={TCP_TIMEOUT}s "
+          f"重试={TCP_RETRY}...", flush=True)
     tcp_sem = asyncio.Semaphore(TCP_CONCURRENCY)
 
     async def probe(ip, port):
@@ -420,12 +447,55 @@ async def main():
         done += len(batch)
         print(f"  [探活] {done:,}/{total:,} | 开放: {len(open_ports)}", flush=True)
 
-    print(f"[+] 探活完成！开放: {len(open_ports)} 个（过滤 {total - len(open_ports):,} 个）", flush=True)
+    print(f"[+] 探活完成！开放: {len(open_ports)} 个（过滤 {total - len(open_ports):,} 个）",
+          flush=True)
+
+    # 3.5 二次补扫：主扫高并发可能因拥塞/限速漏判，
+    #     把"在别的IP上开放过"的端口在全部IP上低并发重探一遍
+    hot_ports = sorted({p for _, p in open_ports})
+    if hot_ports:
+        known = set(open_ports)
+        cand = [(ip, p) for ip in all_ips for p in hot_ports if (ip, p) not in known]
+        if len(cand) > RESCAN_MAX_TARGETS:
+            random.shuffle(cand)
+            cand = cand[:RESCAN_MAX_TARGETS]
+            print(f"[*] 补扫候选超上限，随机取 {RESCAN_MAX_TARGETS:,} 个", flush=True)
+
+        if cand:
+            print(f"\n[0.5/2 二次补扫] 热门端口 {len(hot_ports)} 种 × 全部IP，"
+                  f"共 {len(cand):,} 个（并发={RESCAN_CONCURRENCY} "
+                  f"超时={RESCAN_TIMEOUT}s）...", flush=True)
+            rescan_sem = asyncio.Semaphore(RESCAN_CONCURRENCY)
+
+            async def reprobe(ip, port):
+                async with rescan_sem:
+                    writer = None
+                    try:
+                        conn = asyncio.open_connection(ip, port)
+                        reader, writer = await asyncio.wait_for(
+                            conn, timeout=RESCAN_TIMEOUT)
+                        return (ip, port)
+                    except Exception:
+                        return None
+                    finally:
+                        if writer:
+                            writer.close()
+                            try:
+                                writer.transport.abort()
+                            except Exception:
+                                pass
+
+            r_res = await asyncio.gather(*[reprobe(a, b) for a, b in cand])
+            found = [r for r in r_res if r]
+            open_ports.extend(found)
+            print(f"[+] 补扫捞回: {len(found)} 个"
+                  f"（主扫漏判率约 {len(found)/len(cand)*100:.2f}%）", flush=True)
 
     # 4. 三阶段初筛
     stage_passed = []
     if open_ports:
-        print(f"\n[1/2 三阶段初筛] 筛选 {len(open_ports)} 个...", flush=True)
+        print(f"\n[1/2 三阶段初筛] 筛选 {len(open_ports)} 个"
+              f"（握手失败重试 {TLS_RETRY} 次）...", flush=True)
         tls_sem = asyncio.Semaphore(TLS_CONCURRENCY)
         v_tasks = [full_verify(ip, port, tls_sem) for ip, port in open_ports]
         v_res = await asyncio.gather(*v_tasks)
