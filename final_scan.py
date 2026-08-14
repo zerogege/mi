@@ -33,7 +33,7 @@ PENDING_MAX_FAIL = 5      # 待确认队列里连续异常这么多轮 → 放�
 # 阶段零：TCP 探活
 TCP_CONCURRENCY = 2500
 TCP_TIMEOUT = 3.0         # 2.0 偏紧：跨洲握手 200-400ms，稍排队就超
-TCP_RETRY = 0             # 立刻重试无效（拥塞不会在几十毫秒内消失），预算给下面的补扫
+TCP_RETRY = 0             # 立刻重试无效（拥塞不会在几十毫秒内消失）
 BATCH_SIZE = 500000
 
 # 黑洞 IP 过滤：某些 IP 前的设备对所有端口都回 SYN-ACK（tarpit/黑洞），
@@ -42,6 +42,9 @@ BLACKHOLE_RATIO = 0.05    # 单IP开放数 ≥ 采样量的这个比例 → 判�
 BLACKHOLE_MIN = 20        # 绝对下限，防止采样量小时误伤
 
 # 阶段零点五：二次补扫（低并发 + 长超时，专治主扫被限速漏掉的）
+# 实测四个 ASN 漏判率均为 0.00%，说明 2500 并发不漏判，故关闭。
+# 若将来提高 TCP_CONCURRENCY 或更换网络环境，可临时置 True 重新验证。
+RESCAN_ENABLED = False
 RESCAN_CONCURRENCY = 200
 RESCAN_TIMEOUT = 6.0
 RESCAN_MAX_TARGETS = 60000   # 33.3个/秒 → 上限约 30 分钟
@@ -483,9 +486,9 @@ async def main():
             if len(bad_ips) > 10:
                 print(f"    ... 另有 {len(bad_ips) - 10} 个", flush=True)
 
-    # 3.5 二次补扫：主扫高并发可能因拥塞/限速漏判，
+    # 3.5 二次补扫（默认关闭，见 RESCAN_ENABLED 注释）：
     #     把"在别的IP上开放过"的端口在全部IP上低并发重探一遍
-    hot_ports = sorted({p for _, p in open_ports})
+    hot_ports = sorted({p for _, p in open_ports}) if RESCAN_ENABLED else []
     if hot_ports:
         known = set(open_ports)
         cand = [(ip, p) for ip in all_ips if ip not in bad_ips
