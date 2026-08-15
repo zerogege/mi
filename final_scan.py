@@ -57,7 +57,12 @@ STAGE3_TIMEOUT = 2.5
 TLS_RETRY = 1             # 仅在"握手未完成"时重试，"明确不符"不重试
 
 # 每次随机抽的端口数
-SAMPLE_N = 1000
+SAMPLE_N = int(os.getenv("SAMPLE_N", "1000"))
+
+# 高价值端口：每轮必扫，不占抽样配额、不记进度。
+# 全端口(1-65535)抽样时，443/8443 这类每轮命中概率只有 1.5%，单独保底。
+ALWAYS_PORTS = {80, 443, 2052, 2053, 2082, 2083, 2086, 2087, 2095, 2096,
+                8080, 8443, 8880}
 
 try:
     import uvloop
@@ -207,7 +212,7 @@ def pick_ports(port_str, key):
         elif part.isdigit():
             all_range.add(int(part))
     if not all_range:
-        all_range = set(range(20000, 60001))
+        all_range = set(range(1, 65536))
 
     scanned = load_scanned_ports(key)
     available = list(all_range - scanned)
@@ -218,7 +223,14 @@ def pick_ports(port_str, key):
     chosen = random.sample(available, min(SAMPLE_N, len(available)))
     scanned.update(chosen)
     save_scanned_ports(key, scanned)
-    return sorted(chosen)
+    print(f"[*] 端口进度: {len(scanned):,}/{len(all_range):,}", flush=True)
+
+    # 必扫端口并入（不写进 scanned，所以每轮都会重扫）
+    always = ALWAYS_PORTS & all_range
+    result = sorted(set(chosen) | always)
+    if always:
+        print(f"[*] 追加必扫高价值端口 {len(always)} 个", flush=True)
+    return result
 
 
 def match_domain_in_cert(sni_domain, cert_str):
@@ -396,7 +408,7 @@ async def api_verify(session, ip, port, sem):
 async def main():
     asn_input = sys.argv[1] if len(sys.argv) > 1 else "8143"
     name_label = sys.argv[2] if len(sys.argv) > 2 else "RESULT"
-    port_range = sys.argv[3] if len(sys.argv) > 3 else "20000-60000"
+    port_range = sys.argv[3] if len(sys.argv) > 3 else "1-65535"
 
     key = _asn_key(name_label)
     asn_clean = asn_input.upper().replace("AS", "").strip()
@@ -431,7 +443,7 @@ async def main():
 
     # 2. 随机抽端口
     ports = pick_ports(port_range, key)
-    print(f"[*] 本次随机抽取 {len(ports)} 个端口", flush=True)
+    print(f"[*] 本次共 {len(ports)} 个端口", flush=True)
 
     total = len(all_ips) * len(ports)
     print(f"[*] 共 {total:,} 个目标", flush=True)
