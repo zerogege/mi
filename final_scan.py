@@ -12,21 +12,21 @@ import urllib.parse
 from collections import Counter
 from functools import lru_cache
 
-import geoip2.database
 import aiohttp
 
 # ==================== 配置 ====================
 CUSTOM_CF_DOMAIN = os.getenv("CUSTOM_CF_DOMAIN", "zeroo.ccwu.cc")
-GEOIP_DB = "GeoLite2-Country.mmdb"
 STATE_DIR = "state"
 
 CF_SNI_1 = "www.cloudflare.com"
 CF_HOST_TEST = "crypto.cloudflare.com"
 
 # 自建检测 API（只用于最终确认少量）
+# 注意：结果文件里的 country 全部来自本 API 的落地探测，
+# 不使用 GeoIP（注册地 ≠ 落地），故本脚本无需 geoip2 依赖。
 CHECK_API = "https://check.tigaa.ccwu.cc/check"
-API_CONCURRENCY = 20      # 从 10 提到 20，抵消重试带来的耗时
-API_TIMEOUT = 30          # 从 20 提到 30，非标端口握手慢
+API_CONCURRENCY = 20
+API_TIMEOUT = 30
 API_RETRY = 2             # API 异常时的重试次数
 PENDING_MAX_FAIL = 5      # 待确认队列里连续异常这么多轮 → 放弃
 
@@ -47,7 +47,7 @@ BLACKHOLE_MIN = 20        # 绝对下限，防止采样量小时误伤
 RESCAN_ENABLED = False
 RESCAN_CONCURRENCY = 200
 RESCAN_TIMEOUT = 6.0
-RESCAN_MAX_TARGETS = 60000   # 33.3个/秒 → 上限约 30 分钟
+RESCAN_MAX_TARGETS = 60000
 
 # 三阶段
 TLS_CONCURRENCY = 300
@@ -74,20 +74,6 @@ SSL_CTX = ssl.create_default_context()
 SSL_CTX.check_hostname = False
 SSL_CTX.verify_mode = ssl.CERT_NONE
 SSL_CTX.options |= ssl.OP_NO_SSLv2 | ssl.OP_NO_SSLv3
-
-try:
-    geo_reader = geoip2.database.Reader(GEOIP_DB)
-except Exception:
-    geo_reader = None
-
-
-def get_country(ip):
-    if geo_reader is None:
-        return "??"
-    try:
-        return geo_reader.country(ip).country.iso_code or "??"
-    except Exception:
-        return "??"
 
 
 @lru_cache(maxsize=32)
