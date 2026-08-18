@@ -15,7 +15,7 @@ from functools import lru_cache
 import aiohttp
 
 # ==================== 配置 ====================
-CUSTOM_CF_DOMAIN = os.getenv("CUSTOM_CF_DOMAIN", "zeroo.ccwu.cc")
+CUSTOM_CF_DOMAIN = os.getenv("CUSTOM_CF_DOMAIN", "")
 STATE_DIR = "state"
 
 CF_SNI_1 = "www.cloudflare.com"
