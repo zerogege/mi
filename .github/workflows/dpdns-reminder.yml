@@ -1,21 +1,24 @@
 name: DPDNS Renewal Reminder
 
 on:
-  # 手动测试
+  # 支持在 Actions 页面手动运行测试
   workflow_dispatch:
 
   schedule:
-    # GitHub Cron 使用 UTC
+    # GitHub Cron 使用 UTC 时间
     # UTC 04:00 = 北京时间 12:00
 
-    # aliver.dpdns.org：每年4月21日提醒
+    # aliver.dpdns.org
+    # 每年 8 月 18 日到期，4 月 21 日约剩余 119 天
     - cron: "0 4 21 4 *"
 
-    # zerooooo.dpdns.org：每年7月1日提醒
+    # zerooooo.dpdns.org
+    # 每年 10 月 28 日到期，7 月 1 日约剩余 119 天
     - cron: "0 4 1 7 *"
 
 jobs:
   notify:
+    name: Send renewal reminder
     runs-on: ubuntu-latest
     timeout-minutes: 5
 
@@ -23,26 +26,31 @@ jobs:
       - name: Build reminder message
         id: message
         shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          CRON_EXPRESSION: ${{ github.event.schedule }}
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
             MESSAGE=$(cat <<'EOF'
           🧪 DPDNS 续期提醒测试
 
-          Telegram Bot 配置正常。
+          Telegram Bot 推送配置正常。
 
           域名续期计划：
 
-          1. aliver.dpdns.org
+          1️⃣ aliver.dpdns.org
           固定到期日：每年 8 月 18 日
-          免费续期提醒：每年 4 月 21 日
+          提醒日期：每年 4 月 21 日
 
-          2. zerooooo.dpdns.org
+          2️⃣ zerooooo.dpdns.org
           固定到期日：每年 10 月 28 日
-          免费续期提醒：每年 7 月 1 日
-          EOF
-          )
+          提醒日期：每年 7 月 1 日
 
-          elif [ "${{ github.event.schedule }}" = "0 4 21 4 *" ]; then
+          收到正式提醒后，请登录 DigitalPlat 后台点击“申请免费续费”。
+          EOF
+            )
+
+          elif [ "$CRON_EXPRESSION" = "0 4 21 4 *" ]; then
             MESSAGE=$(cat <<'EOF'
           🔔 DPDNS 免费续期提醒
 
@@ -55,9 +63,9 @@ jobs:
           后台地址：
           https://dash.domain.digitalplat.org/
           EOF
-          )
+            )
 
-          elif [ "${{ github.event.schedule }}" = "0 4 1 7 *" ]; then
+          elif [ "$CRON_EXPRESSION" = "0 4 1 7 *" ]; then
             MESSAGE=$(cat <<'EOF'
           🔔 DPDNS 免费续期提醒
 
@@ -70,10 +78,15 @@ jobs:
           后台地址：
           https://dash.domain.digitalplat.org/
           EOF
-          )
+            )
 
           else
-            MESSAGE="⚠️ DPDNS 提醒任务被触发，但未识别触发日期。"
+            MESSAGE=$(cat <<'EOF'
+          ⚠️ DPDNS 提醒任务已触发，但无法识别对应的定时规则。
+
+          请登录 GitHub Actions 查看运行日志。
+          EOF
+            )
           fi
 
           {
@@ -83,21 +96,44 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Send Telegram notification
+        shell: bash
         env:
-          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          # 使用你仓库里现有的 Secret 名称
+          TG_BOT_TOKEN: ${{ secrets.TG_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           MESSAGE: ${{ steps.message.outputs.text }}
         run: |
-          RESPONSE=$(curl --fail-with-body --silent --show-error \
+          if [ -z "$TG_BOT_TOKEN" ]; then
+            echo "::error::没有读取到 TG_TOKEN"
+            exit 1
+          fi
+
+          if [ -z "$TG_CHAT_ID" ]; then
+            echo "::error::没有读取到 TG_CHAT_ID"
+            exit 1
+          fi
+
+          HTTP_CODE=$(curl --silent --show-error \
+            --output telegram_response.json \
+            --write-out "%{http_code}" \
             --request POST \
             "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
             --data-urlencode "chat_id=${TG_CHAT_ID}" \
             --data-urlencode "text=${MESSAGE}" \
             --data-urlencode "disable_web_page_preview=true")
 
-          echo "$RESPONSE"
+          echo "Telegram HTTP 状态码：$HTTP_CODE"
+          cat telegram_response.json
+          echo
 
-          if ! echo "$RESPONSE" | jq -e '.ok == true' >/dev/null; then
-            echo "Telegram 推送失败"
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "::error::Telegram API 返回 HTTP $HTTP_CODE"
             exit 1
           fi
+
+          if ! jq -e '.ok == true' telegram_response.json >/dev/null; then
+            echo "::error::Telegram 返回 ok=false"
+            exit 1
+          fi
+
+          echo "Telegram 续期提醒发送成功"
