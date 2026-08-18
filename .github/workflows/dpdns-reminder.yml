@@ -1,0 +1,103 @@
+name: DPDNS Renewal Reminder
+
+on:
+  # 手动测试
+  workflow_dispatch:
+
+  schedule:
+    # GitHub Cron 使用 UTC
+    # UTC 04:00 = 北京时间 12:00
+
+    # aliver.dpdns.org：每年4月21日提醒
+    - cron: "0 4 21 4 *"
+
+    # zerooooo.dpdns.org：每年7月1日提醒
+    - cron: "0 4 1 7 *"
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Build reminder message
+        id: message
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            MESSAGE=$(cat <<'EOF'
+          🧪 DPDNS 续期提醒测试
+
+          Telegram Bot 配置正常。
+
+          域名续期计划：
+
+          1. aliver.dpdns.org
+          固定到期日：每年 8 月 18 日
+          免费续期提醒：每年 4 月 21 日
+
+          2. zerooooo.dpdns.org
+          固定到期日：每年 10 月 28 日
+          免费续期提醒：每年 7 月 1 日
+          EOF
+          )
+
+          elif [ "${{ github.event.schedule }}" = "0 4 21 4 *" ]; then
+            MESSAGE=$(cat <<'EOF'
+          🔔 DPDNS 免费续期提醒
+
+          域名：aliver.dpdns.org
+          固定到期日：每年 8 月 18 日
+          当前预计剩余 119 天，已经进入免费续期窗口。
+
+          请登录 DigitalPlat 后台，点击“申请免费续费”。
+
+          后台地址：
+          https://dash.domain.digitalplat.org/
+          EOF
+          )
+
+          elif [ "${{ github.event.schedule }}" = "0 4 1 7 *" ]; then
+            MESSAGE=$(cat <<'EOF'
+          🔔 DPDNS 免费续期提醒
+
+          域名：zerooooo.dpdns.org
+          固定到期日：每年 10 月 28 日
+          当前预计剩余 119 天，已经进入免费续期窗口。
+
+          请登录 DigitalPlat 后台，点击“申请免费续费”。
+
+          后台地址：
+          https://dash.domain.digitalplat.org/
+          EOF
+          )
+
+          else
+            MESSAGE="⚠️ DPDNS 提醒任务被触发，但未识别触发日期。"
+          fi
+
+          {
+            echo "text<<MESSAGE_EOF"
+            echo "$MESSAGE"
+            echo "MESSAGE_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Send Telegram notification
+        env:
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          MESSAGE: ${{ steps.message.outputs.text }}
+        run: |
+          RESPONSE=$(curl --fail-with-body --silent --show-error \
+            --request POST \
+            "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${TG_CHAT_ID}" \
+            --data-urlencode "text=${MESSAGE}" \
+            --data-urlencode "disable_web_page_preview=true")
+
+          echo "$RESPONSE"
+
+          if ! echo "$RESPONSE" | jq -e '.ok == true' >/dev/null; then
+            echo "Telegram 推送失败"
+            exit 1
+          fi
