@@ -7,7 +7,7 @@ import ipaddress
 import geoip2.database
 
 # ==================== 配置 ====================
-CUSTOM_CF_DOMAIN = os.getenv("CUSTOM_CF_DOMAIN", "zeroo.ccwu.cc")
+CUSTOM_CF_DOMAIN = os.getenv("CUSTOM_CF_DOMAIN", "")
 GEOIP_DB = "GeoLite2-Country.mmdb"
 
 CF_SNI_1 = "www.cloudflare.com"
