@@ -3,7 +3,7 @@ name: Recheck IPs
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 8 */7 * *'   # 每2天一次，UTC 8点（北京16点）
+    - cron: '0 8 */5 * *'   # 每5天一次，UTC 8点（北京16点）
 
 concurrency:
   group: recheck
