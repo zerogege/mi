@@ -1,0 +1,113 @@
+name: Scan JINX
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 4,16 * * *'   # UTC 04:00 / 16:00，北京 12:00 / 00:00
+
+concurrency:
+  group: scan-jinx
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install -r requirements.txt
+
+      - name: Pull state
+        env:
+          TOKEN: ${{ secrets.RESULT_REPO_TOKEN }}
+        run: |
+          git clone https://x-access-token:${TOKEN}@github.com/zerogege/proxyip.git result_repo
+          mkdir -p state
+          cp result_repo/state/*.txt state/ 2>/dev/null || true
+          cp result_repo/*.txt ./ 2>/dev/null || true
+
+      - name: Run Scan
+        env:
+          CUSTOM_CF_DOMAIN: ${{ secrets.CUSTOM_CF_DOMAIN }}
+        run: python final_scan.py "140096" "JINX" "1-65535"
+
+      - name: Push
+        env:
+          TOKEN: ${{ secrets.RESULT_REPO_TOKEN }}
+        run: |
+          cd result_repo
+          mkdir -p state
+
+          cp ../JINX.txt ./ 2>/dev/null || true
+          cp ../state/scanned_ports_JINX.txt state/ 2>/dev/null || true
+          cp ../state/pending_JINX.txt state/ 2>/dev/null || true
+
+          git config user.email "bot@users.noreply.github.com"
+          git config user.name "bot"
+
+          git add JINX.txt || true
+          git add state/scanned_ports_JINX.txt || true
+          git add state/pending_JINX.txt || true
+
+          if git diff --staged --quiet; then
+            echo "no change"
+          else
+            git commit -m "JINX update"
+            for i in {1..5}; do
+              if git pull --rebase origin main; then
+                break
+              fi
+              if [ -d .git/rebase-merge ] || [ -d .git/rebase-apply ]; then
+                CONFLICTS=$(git diff --name-only --diff-filter=U)
+                if [ -n "$CONFLICTS" ]; then
+                  for f in $CONFLICTS; do
+                    sort -u "$f" -o "$f"
+                    git add "$f"
+                  done
+                fi
+                GIT_EDITOR=true git rebase --continue
+              else
+                sleep 2
+              fi
+            done
+            git push origin main
+          fi
+
+      - name: Backup to GitLab
+        if: always()
+        env:
+          GITLAB_TOKEN: ${{ secrets.GITLAB_TOKEN }}
+        run: |
+          git clone https://oauth2:${GITLAB_TOKEN}@gitlab.com/7969521/proxyip-backup.git gitlab_repo
+          cp -r result_repo/*.txt gitlab_repo/ 2>/dev/null || true
+          mkdir -p gitlab_repo/state
+          cp result_repo/state/*.txt gitlab_repo/state/ 2>/dev/null || true
+          cd gitlab_repo
+          git config user.email "bot@backup.com"
+          git config user.name "bot"
+          git add -A
+          if git diff --staged --quiet; then
+            echo "GitLab: no change"
+          else
+            git commit -m "backup"
+            git pull --rebase 2>/dev/null || true
+            git push
+          fi
+
+      - name: Notify TG
+        if: always()
+        run: |
+          COUNT=$(cat count.txt 2>/dev/null || echo "?")
+          if [ "${{ job.status }}" = "success" ]; then
+            MSG="✅ JINX 扫描完成%0A本次新增: ${COUNT} 个"
+          else
+            MSG="❌ JINX 扫描失败%0A状态: ${{ job.status }}"
+          fi
+          curl "https://api.telegram.org/bot${{ secrets.TG_TOKEN }}/sendMessage" \
+            -d chat_id=${{ secrets.TG_CHAT_ID }} \
+            -d text="${MSG}"
