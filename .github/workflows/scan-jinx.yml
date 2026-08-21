@@ -3,7 +3,7 @@ name: Scan JINX
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 4,16 * * *'   # UTC 04:00 / 16:00，北京 12:00 / 00:00
+    #- cron: '0 4,16 * * *'   # UTC 04:00 / 16:00，北京 12:00 / 00:00
 
 concurrency:
   group: scan-jinx
