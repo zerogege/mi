@@ -7,7 +7,7 @@ import urllib.parse
 import aiohttp
 
 # ==================== 配置 ====================
-CHECK_API = "https://check.tigaa.ccwu.cc/check"
+CHECK_API = os.getenv("CHECK_API", "").strip()
 CONCURRENCY = 20              # 从 10 提到 20，抵消重试带来的耗时
 TIMEOUT = 30                  # 从 20 提到 30，非标端口握手慢
 API_RETRY = 2                 # 新增：API 异常时的重试次数
@@ -99,6 +99,9 @@ def sort_key(line):
 async def main():
     if len(sys.argv) < 2:
         print("[-] 用法: python recheck_api.py 文件1.txt [文件2.txt ...]", flush=True)
+        return
+    if not CHECK_API:
+        print("[-] CHECK_API 未配置，退出。", flush=True)
         return
 
     sem = asyncio.Semaphore(CONCURRENCY)
