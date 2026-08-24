@@ -30,6 +30,9 @@ jobs:
           cp result_repo/*.txt ./ 2>/dev/null || true
 
       - name: Recheck
+        env:
+          CHECK_API: ${{ secrets.CHECK_API }}
+          
         run: |
           shopt -s nullglob
           FILES=""
