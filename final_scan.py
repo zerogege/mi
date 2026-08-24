@@ -21,11 +21,10 @@ STATE_DIR = "state"
 CF_SNI_1 = "www.cloudflare.com"
 CF_HOST_TEST = "crypto.cloudflare.com"
 
-# 自建检测 API（只用于最终确认少量）
-# 注意：结果文件里的 country 全部来自本 API 的落地探测，
-# 不使用 GeoIP（注册地 ≠ 落地），故本脚本无需 geoip2 依赖。
-CHECK_API = "https://check.tigaa.ccwu.cc/check"
-API_CONCURRENCY = 20
+# 自建检测 API：地址不硬编码，必须由 workflow 通过 CHECK_API 环境变量注入。
+# 未设置时跳过 API 确认阶段（结果仍会入库，country 留 ?? 等 recheck 填）。
+CHECK_API = os.getenv("CHECK_API", "")
+API_CONCURRENCY = int(os.getenv("API_CONC", "20"))
 API_TIMEOUT = 30
 API_RETRY = 2             # API 异常时的重试次数
 PENDING_MAX_FAIL = 5      # 待确认队列里连续异常这么多轮 → 放弃
@@ -63,6 +62,14 @@ SAMPLE_N = int(os.getenv("SAMPLE_N", "1000"))
 # 全端口(1-65535)抽样时，443/8443 这类每轮命中概率只有 1.5%，单独保底。
 ALWAYS_PORTS = {80, 443, 2052, 2053, 2082, 2083, 2086, 2087, 2095, 2096,
                 8080, 8443, 8880}
+
+# 历史端口档案：曾经出货过的端口，每轮必扫。
+# 端口在客户群体里是长期稳定的 —— 某个端口今天失效可能只是机器重启或临时
+# 不通，几天后会恢复。而随机抽样在 65535 里撞中它的概率只有 1.5%，
+# 等一整轮（约33天）才复扫一次太慢。
+# 档案只增不减、独立于结果文件，所以 recheck 剔除条目不影响它。
+KNOWN_PORTS_ENABLED = os.getenv("KNOWN_PORTS", "on").lower() != "off"
+KNOWN_PORTS_MAX = int(os.getenv("KNOWN_PORTS_MAX", "500"))   # 上限，防长期膨胀
 
 try:
     import uvloop
@@ -142,6 +149,43 @@ def save_scanned_ports(key, ports):
             f.write(f"{p}\n")
 
 
+# ============ 历史端口档案：曾经出货的端口，只增不减 ============
+def _known_ports_file(key):
+    return os.path.join(STATE_DIR, f"known_ports_{key}.txt")
+
+
+def load_known_ports(key):
+    ports = set()
+    try:
+        with open(_known_ports_file(key)) as f:
+            for line in f:
+                s = line.strip()
+                if s.isdigit():
+                    v = int(s)
+                    if 1 <= v <= 65535:
+                        ports.add(v)
+    except FileNotFoundError:
+        pass
+    return ports
+
+
+def save_known_ports(key, ports):
+    """只增不减地维护档案。超过上限时保留数值较大的（非标端口更可能是
+    刻意部署的 proxyip，443/8443 那些本来就在 ALWAYS_PORTS 里兜着）。"""
+    os.makedirs(STATE_DIR, exist_ok=True)
+    keep = sorted(ports)
+    if len(keep) > KNOWN_PORTS_MAX:
+        keep = sorted(keep)[-KNOWN_PORTS_MAX:]
+        print(f"[*] 历史端口档案超过 {KNOWN_PORTS_MAX} 个，保留数值较大的那批",
+              flush=True)
+    fname = _known_ports_file(key)
+    tmp = fname + ".tmp"
+    with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+        for p in keep:
+            f.write(f"{p}\n")
+    os.replace(tmp, fname)
+
+
 # ============ 待确认队列：本地初筛已过、但 API 未答复的条目 ============
 def _pending_file(key):
     return os.path.join(STATE_DIR, f"pending_{key}.txt")
@@ -212,11 +256,21 @@ def pick_ports(port_str, key):
     print(f"[*] 端口进度: {len(scanned):,}/{len(all_range):,}", flush=True)
 
     # 必扫端口并入（不写进 scanned，所以每轮都会重扫）
-    always = ALWAYS_PORTS & all_range
-    result = sorted(set(chosen) | always)
-    if always:
-        print(f"[*] 追加必扫高价值端口 {len(always)} 个", flush=True)
+    extra = ALWAYS_PORTS & all_range
+    n_always = len(extra)
+
+    n_known = 0
+    if KNOWN_PORTS_ENABLED:
+        known = load_known_ports(key) & all_range
+        n_known = len(known - extra)
+        extra |= known
+
+    result = sorted(set(chosen) | extra)
+    if extra:
+        print(f"[*] 追加必扫端口: 高价值 {n_always} 个 + 历史出货 {n_known} 个",
+              flush=True)
     return result
+
 
 
 def match_domain_in_cert(sni_domain, cert_str):
@@ -427,7 +481,7 @@ async def main():
     random.shuffle(all_ips)
     print(f"[+] 拉取到 {len(all_ips)} 个 IP", flush=True)
 
-    # 2. 随机抽端口
+    # 2. 随机抽端口（含高价值必扫 + 历史出货端口）
     ports = pick_ports(port_range, key)
     print(f"[*] 本次共 {len(ports)} 个端口", flush=True)
 
@@ -545,9 +599,15 @@ async def main():
     verify_list = sorted(verify_set, key=lambda x: (ipaddress.ip_address(x[0]), x[1]))
 
     final = []
-    if verify_list:
+    if not (CHECK_API and CHECK_API.strip()):
+        # 未注入 API 地址 → 跳过确认，结果仍入库但 country 留占位等 recheck 填
+        final = [(ip, port, "??") for ip, port in verify_list]
+        print(f"[2/2] 未配置 CHECK_API（应由 workflow 注入），"
+              f"跳过确认，{len(final)} 个直接入库待 recheck 填 country。", flush=True)
+    elif verify_list:
         print(f"\n[2/2 API 确认] 确认 {len(verify_list)} 个"
-              f"（本轮初筛 {len(stage_passed)} + 遗留 {len(pending)}，去重后）...", flush=True)
+              f"（本轮初筛 {len(stage_passed)} + 遗留 {len(pending)}，去重后）...",
+              flush=True)
         api_sem = asyncio.Semaphore(API_CONCURRENCY)
         async with aiohttp.ClientSession() as session:
             a_res = await asyncio.gather(
@@ -589,6 +649,18 @@ async def main():
         print("[-] 无需 API 确认。", flush=True)
 
     save_pending(key, pending)
+
+    # 5.5 更新历史端口档案：把本轮确认可用的端口记入，只增不减。
+    #     独立于结果文件，所以 recheck 剔除条目不会让端口从档案消失。
+    if KNOWN_PORTS_ENABLED and final:
+        known = load_known_ports(key)
+        new_ports = {port for _, port, _ in final} - known
+        if new_ports:
+            known |= new_ports
+            save_known_ports(key, known)
+            print(f"[*] 历史端口档案 +{len(new_ports)} 个"
+                  f"（{sorted(new_ports)[:10]}{'...' if len(new_ports) > 10 else ''}）"
+                  f"，累计 {len(known)} 个", flush=True)
 
     # 6. 读旧结果 + 合并新结果
     output_filename = f"{name_label}.txt"
