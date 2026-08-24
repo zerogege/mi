@@ -34,6 +34,7 @@ jobs:
       - name: Run Scan
         env:
           CUSTOM_CF_DOMAIN: ${{ secrets.CUSTOM_CF_DOMAIN }}
+          CHECK_API: ${{ secrets.CHECK_API }}
         run: python final_scan.py "396856" "Sharon" "1-65535"
 
       - name: Push
@@ -47,14 +48,16 @@ jobs:
           cp ../Sharon.txt ./ 2>/dev/null || true
           cp ../state/scanned_ports_Sharon.txt state/ 2>/dev/null || true
           cp ../state/pending_Sharon.txt state/ 2>/dev/null || true
+          cp ../state/known_ports_Sharon.txt state/ 2>/dev/null || true
 
           git config user.email "bot@users.noreply.github.com"
           git config user.name "bot"
 
-          # 分开 add 并容错：首次运行时 pending 文件可能还不存在
+          # 分开 add 并容错：首次运行时某些 state 文件可能还不存在
           git add Sharon.txt || true
           git add state/scanned_ports_Sharon.txt || true
           git add state/pending_Sharon.txt || true
+          git add state/known_ports_Sharon.txt || true
 
           if git diff --staged --quiet; then
             echo "no change"
