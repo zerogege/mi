@@ -26,12 +26,12 @@ STAGE2_TIMEOUT = 2.5
 STAGE3_TIMEOUT = 2.5
 
 # 端口范围
-PORT_START = 20000
-PORT_END = 40000
+PORT_START = 1
+PORT_END = 65535
 
 # 种子网段
 SEEDS = {
-    "43.159.12.0/24": "HK",
+    "103.117.101.158": "HK",
 }
 
 try:
