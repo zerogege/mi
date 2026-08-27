@@ -272,7 +272,6 @@ def pick_ports(port_str, key):
     return result
 
 
-
 def match_domain_in_cert(sni_domain, cert_str):
     sni_domain = sni_domain.lower()
     cert_str = cert_str.lower()
@@ -530,13 +529,14 @@ async def main():
         if bad_ips:
             op_before = len(open_ports)
             open_ports = [(ip, p) for ip, p in open_ports if ip not in bad_ips]
+            # 只输出统计分布，不逐个列 IP —— 公开仓库的 Actions 日志登录可见
+            counts = sorted((ip_cnt[ip] for ip in bad_ips), reverse=True)
+            mid = counts[len(counts) // 2]
             print(f"[*] 剔除疑似黑洞 IP {len(bad_ips)} 个"
                   f"（单IP开放 ≥ {threshold} 个端口），"
                   f"开放数 {op_before} → {len(open_ports)}", flush=True)
-            for ip in sorted(bad_ips, key=lambda x: -ip_cnt[x])[:10]:
-                print(f"    x {ip} (开放 {ip_cnt[ip]} 个)", flush=True)
-            if len(bad_ips) > 10:
-                print(f"    ... 另有 {len(bad_ips) - 10} 个", flush=True)
+            print(f"    开放端口数分布: 最高 {counts[0]} / 中位 {mid} / "
+                  f"最低 {counts[-1]}", flush=True)
 
     # 3.5 二次补扫（默认关闭，见 RESCAN_ENABLED 注释）：
     #     把"在别的IP上开放过"的端口在全部IP上低并发重探一遍
@@ -636,15 +636,16 @@ async def main():
 
         print(f"[+] 通过: {len(final)} | 明确不通: {dead_n} | "
               f"API异常待下轮: {len(err_now)} | 放弃: {len(gave_up)}", flush=True)
+        # 不打印具体 ip:port —— 这些是本地三阶段初筛已通过的候选，
+        # 比 IP 段信息值钱得多，等于半成品结果
         if err_now:
-            print(f"[!] 以下条目本地初筛已通过，但 API 重试 {API_RETRY} 次仍未答复，"
-                  f"已挂入待确认队列，下轮自动补验：", flush=True)
-            for ip, port in err_now:
-                print(f"    ? {ip}:{port} (第 {pending[(ip, port)]} 次)", flush=True)
+            fails = sorted((pending[k] for k in err_now), reverse=True)
+            print(f"[!] {len(err_now)} 条本地初筛已通过但 API 重试 {API_RETRY} 次"
+                  f"仍未答复，已挂入待确认队列下轮补验"
+                  f"（连续失败次数: 最高 {fails[0]} / 最低 {fails[-1]}）", flush=True)
         if gave_up:
-            print(f"[!] 连续 {PENDING_MAX_FAIL} 轮 API 异常，放弃：", flush=True)
-            for ip, port in gave_up:
-                print(f"    x {ip}:{port}", flush=True)
+            print(f"[!] {len(gave_up)} 条连续 {PENDING_MAX_FAIL} 轮 API 异常，已放弃",
+                  flush=True)
     else:
         print("[-] 无需 API 确认。", flush=True)
 
@@ -658,9 +659,10 @@ async def main():
         if new_ports:
             known |= new_ports
             save_known_ports(key, known)
-            print(f"[*] 历史端口档案 +{len(new_ports)} 个"
-                  f"（{sorted(new_ports)[:10]}{'...' if len(new_ports) > 10 else ''}）"
-                  f"，累计 {len(known)} 个", flush=True)
+            # 不列端口号：哪些非标端口在出货是这套系统最核心的情报，
+            # 档案内容照旧写进 state 文件、推私库，随时可查
+            print(f"[*] 历史端口档案 +{len(new_ports)} 个，累计 {len(known)} 个",
+                  flush=True)
 
     # 6. 读旧结果 + 合并新结果
     output_filename = f"{name_label}.txt"
